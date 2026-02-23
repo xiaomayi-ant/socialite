@@ -9,3 +9,8 @@ dist/
 build/
 .mypy_cache/
 .pytest_cache/
+# macOS metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+**/._*
