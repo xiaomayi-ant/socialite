@@ -126,6 +126,8 @@ async def _track_cost(
     if not store:
         return
     cost_map = {
+        "gpt-4o-mini": {"input": 0.15, "output": 0.60},
+        "gpt-4o": {"input": 2.50, "output": 10.00},
         "claude-haiku-4-5-20251001": {"input": 0.80, "output": 4.00},
         "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00},
     }
@@ -155,6 +157,7 @@ class SocialiteRunner:
         self.auth.load_credentials()
         self.client = MoltbookClient(
             self.moltbook_config, self.auth,
+            openai_api_key=os.getenv("OPENAI_API_KEY"),
             anthropic_api_key=os.getenv("ANTHROPIC_API_KEY"),
         )
         self.strategy = EngagementStrategy(self.moltbook_config)
@@ -584,7 +587,7 @@ class SocialiteRunner:
 
             # Track learning costs
             await _track_cost(
-                self.structured_store, "learner", "claude-haiku-4-5-20251001",
+                self.structured_store, "learner", "gpt-4o-mini",
                 "learning", input_tokens=2000, output_tokens=500,
             )
 
@@ -679,7 +682,7 @@ class SocialiteRunner:
                     await self.structured_store.record_interaction(interaction)
                 await self._update_graph_edge(prop.target_id, posts, "comment")
                 await _track_cost(
-                    self.structured_store, "comment", "claude-haiku-4-5-20251001",
+                    self.structured_store, "comment", "gpt-4o-mini",
                     "comment", input_tokens=500, output_tokens=100,
                 )
             await asyncio.sleep(random.uniform(3, 8))
@@ -726,7 +729,7 @@ class SocialiteRunner:
                         "strategy_used": prop.strategy,
                     })
                 await _track_cost(
-                    self.structured_store, "post", "claude-haiku-4-5-20251001",
+                    self.structured_store, "post", "gpt-4o-mini",
                     "post", input_tokens=1000, output_tokens=200,
                 )
 

@@ -23,7 +23,7 @@ class UpvoteAgent(BaseAgent):
     def __init__(
         self,
         name: str = "upvote",
-        model_name: str = "claude-haiku-4-5-20251001",
+        model_name: str = "gpt-4o-mini",
         ab_selector: Optional[ABSelector] = None,
     ) -> None:
         super().__init__(name)

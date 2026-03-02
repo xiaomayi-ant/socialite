@@ -23,7 +23,8 @@ services:
       HTTP_PROXY: http://gost-tunnel:1080
       HTTPS_PROXY: http://gost-tunnel:1080
       ALL_PROXY: http://gost-tunnel:1080
-      NO_PROXY: localhost,127.0.0.1,gost-tunnel,qdrant-shared,postgres-db,neo4j-db
+      NO_PROXY: localhost,127.0.0.1,gost-tunnel,qdrant-shared,postgres-db,neo4j-db,moltbook.com,www.moltbook.com
+      no_proxy: localhost,127.0.0.1,gost-tunnel,qdrant-shared,postgres-db,neo4j-db,moltbook.com,www.moltbook.com
     command: python runner.py --interval ${RUN_INTERVAL_MINUTES:-30}
     networks:
       - socialite-app

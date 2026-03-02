@@ -10,9 +10,9 @@ SYSTEM_CONFIG = {
         "debug": False,
     },
     "model": {
-        "provider": "anthropic",
-        "haiku_model": "claude-haiku-4-5-20251001",
-        "sonnet_model": "claude-sonnet-4-20250514",
+        "provider": "openai",
+        "haiku_model": "gpt-4o-mini",
+        "sonnet_model": "gpt-4o",
     },
     "budget": {
         "daily_limit_usd": float(os.getenv("DAILY_BUDGET_USD", "5.0")),
@@ -42,13 +42,13 @@ SYSTEM_CONFIG = {
     },
     "agents": {
         "sensor": {"name": "Sensor", "llm": None},
-        "analysis": {"name": "Analysis", "llm": "claude-haiku"},
-        "comment": {"name": "Comment", "llm": "claude-haiku"},
-        "post": {"name": "Post", "llm": "claude-haiku"},
+        "analysis": {"name": "Analysis", "llm": "gpt-4o-mini"},
+        "comment": {"name": "Comment", "llm": "gpt-4o-mini"},
+        "post": {"name": "Post", "llm": "gpt-4o-mini"},
         "upvote": {"name": "Upvote", "llm": None},
         "follow": {"name": "Follow", "llm": None},
         "coordinator": {"name": "Coordinator", "llm": None},
-        "learner": {"name": "Learner", "llm": "claude-haiku"},
+        "learner": {"name": "Learner", "llm": "gpt-4o-mini"},
         "observer": {"name": "Observer", "llm": None},
     },
     "ab_strategy": {

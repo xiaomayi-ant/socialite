@@ -46,7 +46,7 @@ class CommentAgent(BaseAgent):
         name: str = "comment",
         social_memory=None,
         structured_store=None,
-        model_name: str = "claude-haiku-4-5-20251001",
+        model_name: str = "gpt-4o-mini",
         ab_selector: Optional[ABSelector] = None,
     ) -> None:
         super().__init__(name)

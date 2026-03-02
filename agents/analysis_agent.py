@@ -53,7 +53,7 @@ class AnalysisAgent(BaseAgent):
         self,
         name: str = "analysis",
         social_memory=None,
-        model_name: str = "claude-haiku-4-5-20251001",
+        model_name: str = "gpt-4o-mini",
     ) -> None:
         super().__init__(name)
         self.social_memory = social_memory

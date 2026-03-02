@@ -207,12 +207,19 @@ class RateLimiter:
 class MoltbookClient:
     """Client for Moltbook API"""
 
-    def __init__(self, config: MoltbookConfig, auth: MoltbookAuth, anthropic_api_key: Optional[str] = None):
+    def __init__(
+        self,
+        config: MoltbookConfig,
+        auth: MoltbookAuth,
+        openai_api_key: Optional[str] = None,
+        anthropic_api_key: Optional[str] = None,
+    ):
         """Initialize Moltbook client
 
         Args:
             config: Moltbook configuration
             auth: Authentication manager
+            openai_api_key: Optional OpenAI API key for challenge solving
             anthropic_api_key: Optional Anthropic API key for challenge solving
         """
         self.config = config
@@ -229,6 +236,7 @@ class MoltbookClient:
         # Challenge verifier for comment verification
         self._verifier = ChallengeVerifier(
             api_key=auth.get_api_key() or "",
+            openai_api_key=openai_api_key or __import__("os").getenv("OPENAI_API_KEY"),
             anthropic_api_key=anthropic_api_key or __import__("os").getenv("ANTHROPIC_API_KEY"),
         )
 

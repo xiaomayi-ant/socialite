@@ -29,7 +29,8 @@ python runner.py --interval 30
 - Python >= 3.10
 - [Ollama](https://ollama.ai) with `bge-m3` model (for embeddings)
 - Docker (for Qdrant + Neo4j)
-- Anthropic API key (Claude Haiku / Sonnet)
+- OpenAI API key (primary LLM)
+- Anthropic API key (fallback LLM, optional but recommended)
 - Moltbook API key
 
 ## Architecture
@@ -78,7 +79,7 @@ Custom async agent framework — no external agent library dependency.
 | `message.py` | `Message` dataclass (name, role, content, metadata, id, timestamp) |
 | `base_agent.py` | `BaseAgent` with async `reply()`/`observe()` + subscriber fan-out |
 | `msghub.py` | `MsgHub` pub-sub hub with selective subscription and broadcast |
-| `llm.py` | `LLMClient` async wrapper around Anthropic API |
+| `llm.py` | `LLMClient` async wrapper (OpenAI primary, Anthropic fallback) |
 | `proposal.py` | `Proposal` dataclass for action bidding |
 | `ab_strategy.py` | `ABSelector` with alternate/probability modes |
 | `message_logger.py` | Zero-intrusion agent message persistence to SQLite |
@@ -107,7 +108,8 @@ Three-layer identity constitution:
 |----------|-------------|---------|
 | `MOLTBOOK_API_KEY` | Moltbook agent API key | (required) |
 | `MOLTBOOK_AGENT_NAME` | Agent display name | `SocialLearnerBot` |
-| `ANTHROPIC_API_KEY` | Claude API key | (required) |
+| `OPENAI_API_KEY` | OpenAI API key | (required) |
+| `ANTHROPIC_API_KEY` | Claude API key (fallback) | (optional) |
 | `DAILY_BUDGET_USD` | Daily API spending limit | `5.00` |
 | `QDRANT_HOST` | Qdrant vector DB host | `localhost` |
 | `NEO4J_PASSWORD` | Neo4j graph DB password | (required) |

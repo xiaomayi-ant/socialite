@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""LLMClient — thin async wrapper around Anthropic's API."""
+"""LLMClient — unified async wrapper with OpenAI-first fallback."""
 
 import json
 import logging
@@ -8,31 +8,91 @@ import re
 from typing import Any, Dict, List, Optional, Union
 
 import anthropic
+import httpx
+
+try:
+    from openai import AsyncOpenAI
+except ImportError:  # pragma: no cover - optional dependency at runtime
+    AsyncOpenAI = None
 
 logger = logging.getLogger(__name__)
 
 
 class LLMClient:
-    """Async Claude client.
+    """Unified async LLM client.
 
     Usage::
 
-        llm = LLMClient(model_name="claude-haiku-4-5-20251001", max_tokens=512)
+        llm = LLMClient(model_name="gpt-4o-mini", max_tokens=512)
         text = await llm.call("Summarise this document …")
         data = await llm.call_json("Return JSON with keys …")
     """
 
     def __init__(
         self,
-        model_name: str = "claude-haiku-4-5-20251001",
+        model_name: str = "gpt-4o-mini",
         max_tokens: int = 1024,
         api_key: Optional[str] = None,
+        provider: Optional[str] = None,
     ) -> None:
         self.model_name = model_name
         self.max_tokens = max_tokens
-        self._client = anthropic.AsyncAnthropic(
-            api_key=api_key or os.getenv("ANTHROPIC_API_KEY"),
-        )
+        self.primary_provider = (
+            provider or os.getenv("LLM_PRIMARY_PROVIDER", "openai")
+        ).lower()
+        self.fallback_provider = os.getenv(
+            "LLM_FALLBACK_PROVIDER", "anthropic"
+        ).lower()
+        self._provider_order = self._build_provider_order()
+
+        proxy_url = os.getenv("LLM_PROXY_URL")
+        timeout = float(os.getenv("LLM_HTTP_TIMEOUT_SECONDS", "60"))
+
+        openai_api_key = api_key or os.getenv("OPENAI_API_KEY")
+        anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
+
+        self._openai_client = None
+        if AsyncOpenAI is not None and openai_api_key:
+            self._openai_client = AsyncOpenAI(
+                api_key=openai_api_key,
+                http_client=self._build_http_client(proxy_url, timeout),
+            )
+
+        self._anthropic_client = None
+        if anthropic_api_key:
+            self._anthropic_client = anthropic.AsyncAnthropic(
+                api_key=anthropic_api_key,
+                http_client=self._build_http_client(proxy_url, timeout),
+            )
+
+    def _build_provider_order(self) -> List[str]:
+        providers: List[str] = []
+        for name in (self.primary_provider, self.fallback_provider):
+            if name in ("openai", "anthropic") and name not in providers:
+                providers.append(name)
+        if not providers:
+            providers = ["openai", "anthropic"]
+        return providers
+
+    def _resolve_model_for_provider(self, provider: str) -> str:
+        if provider == "openai":
+            if self.model_name.startswith("claude-"):
+                return os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+            return self.model_name
+        if self.model_name.startswith("gpt-"):
+            return os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
+        return self.model_name
+
+    @staticmethod
+    def _build_http_client(proxy_url: Optional[str], timeout_seconds: float) -> httpx.AsyncClient:
+        kwargs: Dict[str, Any] = {
+            "timeout": timeout_seconds,
+            "trust_env": True,
+        }
+        if proxy_url:
+            kwargs["proxy"] = proxy_url
+            kwargs["trust_env"] = False
+        return httpx.AsyncClient(**kwargs)
 
     async def call(
         self,
@@ -40,20 +100,61 @@ class LLMClient:
         system: Optional[str] = None,
     ) -> str:
         """Send a single-turn prompt and return the assistant text."""
+        last_error: Optional[Exception] = None
+        for idx, provider in enumerate(self._provider_order):
+            try:
+                if provider == "openai":
+                    return await self._call_openai(prompt=prompt, system=system)
+                return await self._call_anthropic(prompt=prompt, system=system)
+            except Exception as e:  # noqa: BLE001
+                last_error = e
+                if idx < len(self._provider_order) - 1:
+                    logger.warning(
+                        "LLM provider %s failed (%s); falling back to %s",
+                        provider,
+                        e,
+                        self._provider_order[idx + 1],
+                    )
+                else:
+                    logger.error("LLM call failed on %s (%s): %s", provider, self.model_name, e)
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("No valid LLM provider configured")
+
+    async def _call_openai(self, prompt: str, system: Optional[str] = None) -> str:
+        if self._openai_client is None:
+            raise RuntimeError("OpenAI client unavailable (missing OPENAI_API_KEY or openai SDK)")
+
+        messages: List[Dict[str, str]] = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+
+        resp = await self._openai_client.chat.completions.create(
+            model=self._resolve_model_for_provider("openai"),
+            messages=messages,
+            max_tokens=self.max_tokens,
+        )
+        text = (resp.choices[0].message.content or "").strip()
+        if not text:
+            raise RuntimeError("Empty OpenAI response")
+        return text
+
+    async def _call_anthropic(self, prompt: str, system: Optional[str] = None) -> str:
+        if self._anthropic_client is None:
+            raise RuntimeError("Anthropic client unavailable (missing ANTHROPIC_API_KEY)")
+
         messages = [{"role": "user", "content": prompt}]
         kwargs: Dict[str, Any] = {
-            "model": self.model_name,
+            "model": self._resolve_model_for_provider("anthropic"),
             "max_tokens": self.max_tokens,
             "messages": messages,
         }
         if system:
             kwargs["system"] = system
-        try:
-            resp = await self._client.messages.create(**kwargs)
-            return resp.content[0].text
-        except Exception as e:
-            logger.error("LLM call failed (%s): %s", self.model_name, e)
-            raise
+        resp = await self._anthropic_client.messages.create(**kwargs)
+        return resp.content[0].text
 
     async def call_json(
         self,

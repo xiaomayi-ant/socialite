@@ -7,6 +7,7 @@ be solved within 5 minutes.
 """
 
 import re
+import os
 import requests
 from typing import Optional, Dict, Any
 
@@ -17,15 +18,23 @@ logger = logging.getLogger(__name__)
 class ChallengeVerifier:
     """Solves and submits Moltbook math verification challenges"""
 
-    def __init__(self, api_key: str, anthropic_api_key: Optional[str] = None):
+    def __init__(
+        self,
+        api_key: str,
+        openai_api_key: Optional[str] = None,
+        anthropic_api_key: Optional[str] = None,
+    ):
         """Initialize verifier
 
         Args:
             api_key: Moltbook API key for submitting answers
+            openai_api_key: Optional OpenAI API key for LLM solving
             anthropic_api_key: Optional Anthropic API key for LLM solving
         """
         self.api_key = api_key
+        self.openai_api_key = openai_api_key
         self.anthropic_api_key = anthropic_api_key
+        self.llm_proxy_url = os.getenv("LLM_PROXY_URL")
         self.base_url = "https://www.moltbook.com/api/v1"
 
     def solve_and_submit(self, verification_code: str, challenge_text: str) -> bool:
@@ -63,9 +72,13 @@ class ChallengeVerifier:
         if answer is not None:
             return answer
 
-        # Fall back to LLM if available
+        # Fall back to LLM if available (OpenAI first)
+        if self.openai_api_key:
+            answer = self._solve_with_openai(challenge_text)
+            if answer is not None:
+                return answer
         if self.anthropic_api_key:
-            return self._solve_with_llm(challenge_text)
+            return self._solve_with_anthropic(challenge_text)
 
         return None
 
@@ -173,8 +186,62 @@ class ChallengeVerifier:
         cleaned = re.sub(r"[^a-zA-Z0-9\s]", " ", text)
         return re.sub(r"\s+", " ", cleaned).strip()
 
-    def _solve_with_llm(self, challenge_text: str, retries: int = 5) -> Optional[str]:
-        """Use Claude to solve the challenge
+    def _solve_with_openai(self, challenge_text: str, retries: int = 3) -> Optional[str]:
+        """Use OpenAI to solve the challenge."""
+        try:
+            import time
+            import httpx
+            from openai import OpenAI
+
+            http_client = None
+            if self.llm_proxy_url:
+                http_client = httpx.Client(proxy=self.llm_proxy_url, trust_env=False)
+
+            client = OpenAI(
+                api_key=self.openai_api_key,
+                http_client=http_client,
+            )
+            cleaned_text = self._preprocess_for_llm(challenge_text)
+
+            for attempt in range(retries):
+                try:
+                    message = client.chat.completions.create(
+                        model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+                        max_tokens=16,
+                        messages=[
+                            {
+                                "role": "user",
+                                "content": (
+                                    "The text below is a math word problem with obfuscated formatting "
+                                    "(random caps, noise characters inserted inside words). "
+                                    "Step 1: Reconstruct all the numbers mentioned (e.g. 'tw enty fo ur' = 24). "
+                                    "Step 2: Identify the operation (add/gains/plus/more = +, "
+                                    "multiply/times = *, subtract/loses/minus = -, divide = /). "
+                                    "Step 3: Compute the FINAL total after applying all operations. "
+                                    "Reply with ONLY the final computed number in XX.XX format.\n\n"
+                                    f"{cleaned_text}"
+                                ),
+                            }
+                        ],
+                    )
+                    raw = (message.choices[0].message.content or "").strip()
+                    match = re.search(r"\d+(?:\.\d+)?", raw)
+                    if not match:
+                        raise ValueError(f"No number in response: {raw!r}")
+                    return f"{float(match.group()):.2f}"
+                except Exception as e:
+                    if attempt < retries - 1:
+                        wait = min(2 ** attempt, 8)
+                        logger.warning("OpenAI solve failed, retrying in %ds: %s", wait, e)
+                        time.sleep(wait)
+                        continue
+                    raise
+        except Exception as e:
+            logger.info("   ⚠️  OpenAI solve failed: %s", e)
+            return None
+
+    def _solve_with_anthropic(self, challenge_text: str, retries: int = 5) -> Optional[str]:
+        """Use Claude to solve the challenge.
 
         Args:
             challenge_text: Obfuscated challenge text
@@ -186,7 +253,16 @@ class ChallengeVerifier:
         try:
             import anthropic
             import time
-            client = anthropic.Anthropic(api_key=self.anthropic_api_key)
+            import httpx
+
+            http_client = None
+            if self.llm_proxy_url:
+                http_client = httpx.Client(proxy=self.llm_proxy_url, trust_env=False)
+
+            client = anthropic.Anthropic(
+                api_key=self.anthropic_api_key,
+                http_client=http_client,
+            )
 
             # Pre-clean: strip noise characters so LLM can read broken words
             cleaned_text = self._preprocess_for_llm(challenge_text)

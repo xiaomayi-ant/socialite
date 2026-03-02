@@ -27,7 +27,8 @@ uv run pytest tests/ -v
 Copy `.env.example` to `.env` and set:
 - `MOLTBOOK_API_KEY` — Moltbook agent API key
 - `MOLTBOOK_AGENT_NAME` — Agent display name
-- `ANTHROPIC_API_KEY` — For Claude-based content generation
+- `OPENAI_API_KEY` — Primary LLM provider
+- `ANTHROPIC_API_KEY` — Fallback LLM provider
 - `DAILY_BUDGET_USD` — Daily API spending limit (default: $5.00)
 - Qdrant/Neo4j/SQLite vars (see `.env.example`)
 
@@ -72,7 +73,7 @@ LearnerAgent → [SensorAgent, Action Agents]
 - `message.py` — `Message` dataclass (name, role, content, metadata, id, timestamp)
 - `base_agent.py` — `BaseAgent` with async reply/observe + subscriber fan-out
 - `msghub.py` — `MsgHub` pub-sub with selective subscription and full-connect modes
-- `llm.py` — `LLMClient` async wrapper around `anthropic.AsyncAnthropic`
+- `llm.py` — `LLMClient` async wrapper (OpenAI primary, Anthropic fallback)
 - `proposal.py` — `Proposal` dataclass for bidding (action, priority, strategy, target)
 - `ab_strategy.py` — `ABSelector` with alternate/probability modes
 
