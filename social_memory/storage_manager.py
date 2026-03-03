@@ -22,7 +22,7 @@ from .vector_store import VectorStorageManager
 from .structured_store import StructuredStorageManager
 from .knowledge_graph import KnowledgeGraphManager
 from .recorder import SocialInteractionRecorder
-from .embeddings import BGEEmbeddingModel
+from .embeddings import BaseEmbeddingModel, create_embedding_model
 
 import logging
 logger = logging.getLogger(__name__)
@@ -44,12 +44,19 @@ class SocialMemoryManager:
         self.recorder: Optional[SocialInteractionRecorder] = None
         self._initialized = False
 
-        # Initialize embedding model
+        # Initialize embedding model (supports ollama/siliconflow providers)
         if config.embedding_model_name:
-            logger.info("Initializing embedding model: %s...", config.embedding_model_name)
-            self.embedding_model = BGEEmbeddingModel(
+            logger.info(
+                "Initializing embedding model provider=%s model=%s...",
+                config.embedding_provider,
+                config.embedding_model_name,
+            )
+            self.embedding_model: Optional[BaseEmbeddingModel] = create_embedding_model(
+                provider=config.embedding_provider,
                 model_name=config.embedding_model_name,
                 dimension=config.vector_store.vector_size,
+                api_url=config.embedding_api_url,
+                api_key=config.embedding_api_key,
             )
         else:
             logger.warning("No embedding model specified, using placeholder")

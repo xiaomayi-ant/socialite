@@ -126,11 +126,17 @@ class SocialMemoryConfig(BaseModel):
     )
 
     # Embedding configuration
+    embedding_provider: str = Field(
+        default="ollama", description='Embedding provider ("ollama" or "siliconflow")'
+    )
     embedding_model_name: str = Field(
         default="", description="Embedding model name (placeholder)"
     )
     embedding_api_key: str = Field(
         default="", description="Embedding API key (placeholder)"
+    )
+    embedding_api_url: str = Field(
+        default="", description="Embedding API URL (provider endpoint)"
     )
 
     # Logging configuration
@@ -151,6 +157,14 @@ class SocialMemoryConfig(BaseModel):
     @classmethod
     def from_env(cls) -> "SocialMemoryConfig":
         """Create complete config from environment variables"""
+        embedding_provider = os.getenv("EMBEDDING_PROVIDER", "ollama").strip().lower()
+        if embedding_provider == "siliconflow":
+            default_model_name = "BAAI/bge-m3"
+            default_api_url = "https://api.siliconflow.cn/v1/embeddings"
+        else:
+            default_model_name = "bge-m3"
+            default_api_url = "http://localhost:11434/api/embeddings"
+
         return cls(
             vector_store=VectorStoreConfig.from_env(),
             structured_store=StructuredStoreConfig.from_env(),
@@ -158,8 +172,10 @@ class SocialMemoryConfig(BaseModel):
             supported_platforms=os.getenv(
                 "SUPPORTED_PLATFORMS", "weibo,zhihu,xiaohongshu,wechat"
             ).split(","),
-            embedding_model_name=os.getenv("EMBEDDING_MODEL_NAME", "bge-m3"),
+            embedding_provider=embedding_provider,
+            embedding_model_name=os.getenv("EMBEDDING_MODEL_NAME", default_model_name),
             embedding_api_key=os.getenv("EMBEDDING_API_KEY", ""),
+            embedding_api_url=os.getenv("EMBEDDING_API_URL", default_api_url),
             log_level=os.getenv("LOG_LEVEL", "INFO"),
             log_file=os.getenv("LOG_FILE", "./logs/social_memory.log"),
         )
@@ -170,6 +186,14 @@ class SocialMemoryConfig(BaseModel):
             # Validate required fields
             if self.enable_vectorization and not self.embedding_model_name:
                 logger.warning("Warning: Vectorization enabled but no embedding model specified")
+            if self.embedding_provider not in {"ollama", "siliconflow"}:
+                raise ValueError(
+                    f"Invalid embedding provider: {self.embedding_provider}"
+                )
+            if self.embedding_provider == "siliconflow" and not self.embedding_api_key:
+                logger.warning(
+                    "Warning: SiliconFlow provider selected but EMBEDDING_API_KEY is empty"
+                )
 
             # Validate platform list
             if not self.supported_platforms:
