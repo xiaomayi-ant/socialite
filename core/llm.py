@@ -5,7 +5,7 @@ import json
 import logging
 import os
 import re
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import anthropic
 import httpx
@@ -28,15 +28,25 @@ class LLMClient:
         data = await llm.call_json("Return JSON with keys …")
     """
 
+    # ── Token pricing per 1M tokens: (input, output) ──
+    _PRICING: Dict[str, Tuple[float, float]] = {
+        "gpt-4o-mini": (0.15, 0.60),
+        "gpt-4o": (2.50, 10.00),
+        "claude-haiku-4-5-20251001": (0.80, 4.00),
+    }
+    _DEFAULT_PRICING: Tuple[float, float] = (1.00, 3.00)
+
     def __init__(
         self,
         model_name: str = "gpt-4o-mini",
         max_tokens: int = 1024,
         api_key: Optional[str] = None,
         provider: Optional[str] = None,
+        cost_recorder: Optional[Callable] = None,
     ) -> None:
         self.model_name = model_name
         self.max_tokens = max_tokens
+        self.cost_recorder = cost_recorder
         self.primary_provider = (
             provider or os.getenv("LLM_PRIMARY_PROVIDER", "openai")
         ).lower()
@@ -94,6 +104,14 @@ class LLMClient:
             kwargs["trust_env"] = False
         return httpx.AsyncClient(**kwargs)
 
+    @staticmethod
+    def _estimate_cost(
+        model: str, input_tokens: int, output_tokens: int
+    ) -> float:
+        """Estimate USD cost from token counts."""
+        pricing = LLMClient._PRICING.get(model, LLMClient._DEFAULT_PRICING)
+        return (input_tokens * pricing[0] + output_tokens * pricing[1]) / 1_000_000
+
     async def call(
         self,
         prompt: str,
@@ -104,8 +122,16 @@ class LLMClient:
         for idx, provider in enumerate(self._provider_order):
             try:
                 if provider == "openai":
-                    return await self._call_openai(prompt=prompt, system=system)
-                return await self._call_anthropic(prompt=prompt, system=system)
+                    text, usage = await self._call_openai(prompt=prompt, system=system)
+                else:
+                    text, usage = await self._call_anthropic(prompt=prompt, system=system)
+                # Fire-and-forget cost recording
+                if self.cost_recorder and usage:
+                    try:
+                        self.cost_recorder(usage)
+                    except Exception:
+                        logger.debug("Cost recorder failed (non-fatal)")
+                return text
             except Exception as e:  # noqa: BLE001
                 last_error = e
                 if idx < len(self._provider_order) - 1:
@@ -122,7 +148,9 @@ class LLMClient:
             raise last_error
         raise RuntimeError("No valid LLM provider configured")
 
-    async def _call_openai(self, prompt: str, system: Optional[str] = None) -> str:
+    async def _call_openai(
+        self, prompt: str, system: Optional[str] = None
+    ) -> Tuple[str, Optional[Dict[str, Any]]]:
         if self._openai_client is None:
             raise RuntimeError("OpenAI client unavailable (missing OPENAI_API_KEY or openai SDK)")
 
@@ -131,30 +159,59 @@ class LLMClient:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
 
+        model = self._resolve_model_for_provider("openai")
         resp = await self._openai_client.chat.completions.create(
-            model=self._resolve_model_for_provider("openai"),
+            model=model,
             messages=messages,
             max_tokens=self.max_tokens,
         )
         text = (resp.choices[0].message.content or "").strip()
         if not text:
             raise RuntimeError("Empty OpenAI response")
-        return text
 
-    async def _call_anthropic(self, prompt: str, system: Optional[str] = None) -> str:
+        usage: Optional[Dict[str, Any]] = None
+        if resp.usage:
+            input_tokens = resp.usage.prompt_tokens or 0
+            output_tokens = resp.usage.completion_tokens or 0
+            usage = {
+                "model": model,
+                "provider": "openai",
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "estimated_cost_usd": self._estimate_cost(model, input_tokens, output_tokens),
+            }
+        return text, usage
+
+    async def _call_anthropic(
+        self, prompt: str, system: Optional[str] = None
+    ) -> Tuple[str, Optional[Dict[str, Any]]]:
         if self._anthropic_client is None:
             raise RuntimeError("Anthropic client unavailable (missing ANTHROPIC_API_KEY)")
 
         messages = [{"role": "user", "content": prompt}]
+        model = self._resolve_model_for_provider("anthropic")
         kwargs: Dict[str, Any] = {
-            "model": self._resolve_model_for_provider("anthropic"),
+            "model": model,
             "max_tokens": self.max_tokens,
             "messages": messages,
         }
         if system:
             kwargs["system"] = system
         resp = await self._anthropic_client.messages.create(**kwargs)
-        return resp.content[0].text
+        text = resp.content[0].text
+
+        usage: Optional[Dict[str, Any]] = None
+        if resp.usage:
+            input_tokens = resp.usage.input_tokens or 0
+            output_tokens = resp.usage.output_tokens or 0
+            usage = {
+                "model": model,
+                "provider": "anthropic",
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "estimated_cost_usd": self._estimate_cost(model, input_tokens, output_tokens),
+            }
+        return text, usage
 
     async def call_json(
         self,
