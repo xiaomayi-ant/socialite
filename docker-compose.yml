@@ -1,14 +1,4 @@
 services:
-  gost-tunnel:
-    image: ginuerzh/gost
-    container_name: socialite-gost-tunnel
-    # Example:
-    # GOST_FORWARD_URL=relay+tls://user:password@your-relay-host:8443
-    command: -L=:1080 -F=${GOST_FORWARD_URL}
-    restart: unless-stopped
-    networks:
-      - socialite-app
-
   socialite:
     image: ghcr.io/xiaomayi-ant/socialite:${SOCIALITE_IMAGE_TAG:-latest}
     pull_policy: always
@@ -19,14 +9,6 @@ services:
       - ./data:/app/data
     env_file:
       - .env
-    depends_on:
-      - gost-tunnel
-    environment:
-      HTTP_PROXY: ${HTTP_PROXY:-http://gost-tunnel:1080}
-      HTTPS_PROXY: ${HTTPS_PROXY:-http://gost-tunnel:1080}
-      ALL_PROXY: ${ALL_PROXY:-http://gost-tunnel:1080}
-      NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1,gost-tunnel,qdrant-shared,postgres-db,neo4j-db}
-      no_proxy: ${no_proxy:-localhost,127.0.0.1,gost-tunnel,qdrant-shared,postgres-db,neo4j-db}
     command: python runner.py --interval ${RUN_INTERVAL_MINUTES:-30}
     networks:
       - socialite-app
