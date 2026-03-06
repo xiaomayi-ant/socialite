@@ -9,7 +9,7 @@ services:
       - ./data:/app/data
     env_file:
       - .env
-    command: python runner.py --interval ${RUN_INTERVAL_MINUTES:-30}
+    command: python runner.py
     networks:
       - socialite-app
       - ai-infra
