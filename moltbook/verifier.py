@@ -71,11 +71,23 @@ class ChallengeVerifier:
         provider = os.getenv("MOLTBOOK_VERIFIER_PROVIDER", "openai").lower()
         if provider == "anthropic":
             if self.anthropic_api_key:
+                logger.info(
+                    "   Verifier provider=%s model=%s",
+                    provider,
+                    os.getenv(
+                        "MOLTBOOK_VERIFIER_ANTHROPIC_MODEL",
+                        "claude-haiku-4-5-20251001",
+                    ),
+                )
                 return self._solve_with_anthropic(challenge_text)
             logger.warning("Verifier provider is anthropic but ANTHROPIC_API_KEY is not configured")
             return None
 
         if self.openai_api_key:
+            logger.info(
+                "   Verifier provider=openai model=%s",
+                self._openai_model_name(),
+            )
             return self._solve_with_openai(challenge_text)
         if provider == "openai":
             logger.warning("Verifier provider is openai but OPENAI_API_KEY is not configured")

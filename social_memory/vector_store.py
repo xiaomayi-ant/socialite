@@ -5,6 +5,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 import asyncio
+import os
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 
@@ -64,6 +65,17 @@ class VectorStorageManager:
                 # In-memory mode for development
                 self.client = QdrantClient(":memory:")
             else:
+                logger.info(
+                    "Connecting to Qdrant host=%s port=%s via_proxy=%s no_proxy=%s",
+                    self.config.host,
+                    self.config.port,
+                    bool(
+                        os.getenv("HTTP_PROXY")
+                        or os.getenv("HTTPS_PROXY")
+                        or os.getenv("ALL_PROXY")
+                    ),
+                    os.getenv("NO_PROXY") or os.getenv("no_proxy") or "",
+                )
                 # Persistent mode
                 self.client = QdrantClient(
                     host=self.config.host,
