@@ -66,9 +66,10 @@ class VectorStorageManager:
                 self.client = QdrantClient(":memory:")
             else:
                 logger.info(
-                    "Connecting to Qdrant host=%s port=%s via_proxy=%s no_proxy=%s",
+                    "Connecting to Qdrant host=%s port=%s https=%s via_proxy=%s no_proxy=%s",
                     self.config.host,
                     self.config.port,
+                    self.config.https,
                     bool(
                         os.getenv("HTTP_PROXY")
                         or os.getenv("HTTPS_PROXY")
@@ -80,6 +81,7 @@ class VectorStorageManager:
                 self.client = QdrantClient(
                     host=self.config.host,
                     port=self.config.port,
+                    https=self.config.https,
                     api_key=self.config.api_key,
                 )
 
