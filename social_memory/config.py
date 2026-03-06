@@ -17,6 +17,7 @@ class VectorStoreConfig(BaseModel):
 
     host: str = Field(default="localhost", description="Qdrant host")
     port: int = Field(default=6333, description="Qdrant port")
+    https: Optional[bool] = Field(default=None, description="Whether to use HTTPS for Qdrant")
     api_key: Optional[str] = Field(default=None, description="Qdrant API key")
     collection_name: str = Field(default="social_posts", description="Collection name")
     vector_size: int = Field(default=768, description="Vector dimension")
@@ -32,9 +33,11 @@ class VectorStoreConfig(BaseModel):
     @classmethod
     def from_env(cls) -> "VectorStoreConfig":
         """Create config from environment variables"""
+        https_env = os.getenv("QDRANT_HTTPS")
         return cls(
             host=os.getenv("QDRANT_HOST", "localhost"),
             port=int(os.getenv("QDRANT_PORT", "6333")),
+            https=https_env.lower() == "true" if https_env is not None else None,
             api_key=os.getenv("QDRANT_API_KEY") or None,
             collection_name=os.getenv("QDRANT_COLLECTION_NAME", "social_posts"),
             vector_size=int(os.getenv("EMBEDDING_MODEL_DIMENSION", "1024")),
