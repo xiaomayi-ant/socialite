@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """AnalysisAgent — data enrichment publisher.
 
-Subscribes to SensorAgent's raw_feed → computes novelty/quality/topics/semantic
-→ publishes analysis_result to all subscribers.
+Autonomous mode: reacts to raw_feed messages via observe(),
+analyses and broadcasts results to all agents.
 """
 
 import json
@@ -11,42 +11,23 @@ import math
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+from agents.prompt_templates import (
+    build_agent_system_prompt,
+    build_analysis_semantic_prompt,
+    build_analysis_topic_prompt,
+)
 from core.base_agent import BaseAgent
 from core.llm import LLMClient
 from core.message import Message
 
 logger = logging.getLogger(__name__)
 
-ANALYST_SYSTEM_PROMPT = """\
-You are the Analyst module of Socialite. Analyse a batch of Moltbook feed posts \
-and return a JSON object with these keys:
-
-1. "trending_topics": list of 3-5 topic strings currently trending.
-2. "high_quality_posts": list of post IDs that are high quality (thoughtful, good engagement).
-3. "engage_targets": list of post IDs worth commenting on (active discussion, we can add value).
-4. "topic_summary": one-paragraph summary of community discussion.
-
-Respond ONLY with valid JSON. No markdown fences, no explanation.\
-"""
-
-SEMANTIC_PROMPT = """\
-Analyze each post briefly. Respond ONLY with a JSON array, no explanation.
-
-[{"post_id":"xxx","is_compliant":true,"violation_type":"none","semantic_value":0.7,"has_unique_perspective":true}]
-
-Fields:
-- is_compliant: no spam/harassment? (bool)
-- violation_type: spam/harassment/other/none
-- semantic_value: 0-1 how valuable the perspective is
-- has_unique_perspective: unique viewpoint? (bool)
-"""
-
 
 class AnalysisAgent(BaseAgent):
     """Analyses the feed: trending topics, novelty scores, engagement targets.
 
-    Produces an analysis_result Message that is automatically broadcast to
-    all subscribers via the MsgHub wiring.
+    Autonomous: when it receives a raw_feed message via observe(),
+    it automatically analyses and broadcasts the result.
     """
 
     def __init__(
@@ -58,6 +39,32 @@ class AnalysisAgent(BaseAgent):
         super().__init__(name)
         self.social_memory = social_memory
         self.llm = LLMClient(model_name=model_name, max_tokens=2048)
+        self.system_prompt = build_agent_system_prompt("analysis")
+
+    # ── Autonomous: react to raw_feed ────────────────────────
+
+    async def observe(self, msg: Message) -> None:
+        """When raw_feed arrives, auto-analyse and broadcast."""
+        msg_type = msg.metadata.get("type", "")
+
+        if msg_type == "raw_feed":
+            posts = msg.metadata.get("posts", [])
+            if not posts:
+                return
+            logger.info("Analysis: received %d posts, analysing...", len(posts))
+            analysis = await self.analyse_feed(posts)
+            if self._hub:
+                await self._hub.broadcast(Message(
+                    name=self.name,
+                    role="assistant",
+                    content=json.dumps({"type": "analysis_result"}),
+                    metadata=analysis,
+                    causation_id=msg.id,
+                    trace_id=msg.trace_id,
+                ))
+            return
+
+        await super().observe(msg)
 
     # ── Novelty scoring ──────────────────────────────────────
 
@@ -171,6 +178,7 @@ class AnalysisAgent(BaseAgent):
             "learning_values": learning_values,
             "topic_summary": llm_analysis.get("topic_summary", ""),
             "semantic_analysis": semantic_analysis,
+            "posts": posts,
         }
 
     async def _semantic_analysis(self, posts: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -184,7 +192,8 @@ class AnalysisAgent(BaseAgent):
             return {}
         try:
             data = await self.llm.call_json(
-                SEMANTIC_PROMPT + "\n\nPosts:\n" + "\n".join(post_texts)
+                build_analysis_semantic_prompt(post_texts),
+                system=self.system_prompt,
             )
             if isinstance(data, list):
                 return {r["post_id"]: r for r in data}
@@ -196,7 +205,8 @@ class AnalysisAgent(BaseAgent):
     async def _call_llm(self, feed_text: str) -> Dict[str, Any]:
         try:
             return await self.llm.call_json(
-                ANALYST_SYSTEM_PROMPT + "\n\nPosts:\n" + feed_text
+                build_analysis_topic_prompt(feed_text),
+                system=self.system_prompt,
             )
         except Exception as e:
             logger.warning("LLM analysis failed: %s", e)

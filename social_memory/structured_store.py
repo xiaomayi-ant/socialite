@@ -21,11 +21,8 @@ from .config import StructuredStoreConfig
 from .models import (
     SocialPost,
     SocialComment,
-    SocialInteraction,
-    LearningPattern,
     SocialUser,
     EngagementMetrics,
-    SocialInteractionSummary,
 )
 
 
@@ -111,11 +108,58 @@ class StructuredStorageManager:
             "CREATE INDEX IF NOT EXISTS idx_agent_messages_cycle ON agent_messages(cycle_count)",
             "CREATE INDEX IF NOT EXISTS idx_agent_messages_sender ON agent_messages(sender)",
             "CREATE INDEX IF NOT EXISTS idx_agent_messages_type ON agent_messages(message_type)",
+            "CREATE INDEX IF NOT EXISTS idx_agent_messages_direction ON agent_messages(direction)",
+            "CREATE INDEX IF NOT EXISTS idx_rate_limit_events_action ON rate_limit_events(action_type)",
+            "CREATE INDEX IF NOT EXISTS idx_rate_limit_events_reason ON rate_limit_events(reason)",
+            "CREATE INDEX IF NOT EXISTS idx_behavior_log_action_time ON behavior_log(action_type, timestamp)",
+            "CREATE INDEX IF NOT EXISTS idx_injection_events_cycle ON prompt_injection_events(cycle_count)",
+            "CREATE INDEX IF NOT EXISTS idx_injection_events_agent ON prompt_injection_events(agent_name)",
+            "CREATE INDEX IF NOT EXISTS idx_injection_events_verdict ON prompt_injection_events(verdict)",
+            "CREATE INDEX IF NOT EXISTS idx_injection_events_trace ON prompt_injection_events(trace_id)",
         ]:
             cursor.execute(idx_sql)
 
+        self._create_sqlite_views(cursor)
+
         conn.commit()
         conn.close()
+
+    def _create_sqlite_views(self, cursor: sqlite3.Cursor) -> None:
+        """Create read-only observability views for cycle-level diagnostics."""
+        views = [
+            """
+            CREATE VIEW IF NOT EXISTS vw_agent_message_direction_summary AS
+            SELECT
+                cycle_count,
+                direction,
+                COUNT(*) AS total
+            FROM agent_messages
+            GROUP BY cycle_count, direction
+            """,
+            """
+            CREATE VIEW IF NOT EXISTS vw_agent_message_drop_summary AS
+            SELECT
+                cycle_count,
+                message_type,
+                COUNT(*) AS total
+            FROM agent_messages
+            WHERE direction = 'hub_drop'
+            GROUP BY cycle_count, message_type
+            """,
+            """
+            CREATE VIEW IF NOT EXISTS vw_rate_limit_cycle_summary AS
+            SELECT
+                json_extract(details, '$.cycle_count') AS cycle_count,
+                action_type,
+                allowed,
+                reason,
+                COUNT(*) AS total
+            FROM rate_limit_events
+            GROUP BY json_extract(details, '$.cycle_count'), action_type, allowed, reason
+            """,
+        ]
+        for sql in views:
+            cursor.execute(sql)
 
     def _create_postgres_tables(self) -> None:
         """Create PostgreSQL tables"""
@@ -259,25 +303,7 @@ class StructuredStorageManager:
                     FOREIGN KEY (post_id) REFERENCES own_posts(post_id)
                 )
             """,
-            # ════ Layer 3: Learning & Patterns (3 tables) ════
-            "patterns": """
-                CREATE TABLE IF NOT EXISTS patterns (
-                    pattern_id TEXT PRIMARY KEY,
-                    description TEXT NOT NULL,
-                    pattern_source TEXT NOT NULL,
-                    confidence REAL DEFAULT 0.5,
-                    success_rate REAL DEFAULT 0.0,
-                    sample_count INTEGER DEFAULT 0,
-                    topics TEXT,
-                    effectiveness_score REAL DEFAULT 0.0,
-                    usage_count INTEGER DEFAULT 0,
-                    last_used TIMESTAMP,
-                    example_ids TEXT,
-                    metadata TEXT,
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                )
-            """,
+            # ════ Layer 3: Learning & Patterns ════
             "style_patterns": """
                 CREATE TABLE IF NOT EXISTS style_patterns (
                     pattern_id TEXT PRIMARY KEY,
@@ -316,31 +342,7 @@ class StructuredStorageManager:
                     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             """,
-            # ════ Auxiliary Tables (kept for reference) ════
-            "social_interactions": """
-                CREATE TABLE IF NOT EXISTS social_interactions (
-                    interaction_id TEXT PRIMARY KEY,
-                    interaction_type TEXT NOT NULL,
-                    content TEXT NOT NULL,
-                    platform TEXT NOT NULL,
-                    target_post_id TEXT,
-                    target_comment_id TEXT,
-                    actor_id TEXT NOT NULL,
-                    timestamp TIMESTAMP NOT NULL,
-                    upvotes INTEGER DEFAULT 0,
-                    downvotes INTEGER DEFAULT 0,
-                    comment_count INTEGER DEFAULT 0,
-                    engagement_timestamp TIMESTAMP,
-                    learning_value REAL DEFAULT 0.0,
-                    feedback_score REAL,
-                    vectorized BOOLEAN DEFAULT FALSE,
-                    pattern_id TEXT,
-                    metadata TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (actor_id) REFERENCES social_users(user_id)
-                )
-            """,
+            # ════ Auxiliary Tables ════
             "api_costs": """
                 CREATE TABLE IF NOT EXISTS api_costs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -364,6 +366,17 @@ class StructuredStorageManager:
                     metadata TEXT
                 )
             """,
+            "rate_limit_events": """
+                CREATE TABLE IF NOT EXISTS rate_limit_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    action_type TEXT NOT NULL,
+                    target_id TEXT,
+                    allowed BOOLEAN DEFAULT 0,
+                    reason TEXT,
+                    details TEXT
+                )
+            """,
             "agent_proposals": """
                 CREATE TABLE IF NOT EXISTS agent_proposals (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -376,16 +389,6 @@ class StructuredStorageManager:
                     reasoning TEXT,
                     strategy TEXT,
                     status TEXT NOT NULL,
-                    metadata TEXT
-                )
-            """,
-            "collection_strategy": """
-                CREATE TABLE IF NOT EXISTS collection_strategy (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    strategy_type TEXT NOT NULL,
-                    parameters TEXT DEFAULT '{}',
-                    source_agent TEXT,
                     metadata TEXT
                 )
             """,
@@ -403,6 +406,25 @@ class StructuredStorageManager:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """,
+            "prompt_injection_events": """
+                CREATE TABLE IF NOT EXISTS prompt_injection_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    message_id TEXT,
+                    trace_id TEXT,
+                    cycle_count INTEGER,
+                    agent_name TEXT NOT NULL,
+                    sender TEXT,
+                    source_type TEXT DEFAULT 'unknown',
+                    trust_level TEXT DEFAULT 'untrusted',
+                    injection_score REAL DEFAULT 0.0,
+                    verdict TEXT NOT NULL,
+                    reasons TEXT DEFAULT '[]',
+                    action_taken TEXT DEFAULT 'observe',
+                    excerpt TEXT,
+                    metadata TEXT
+                )
+            """,
             "observer_reports": """
                 CREATE TABLE IF NOT EXISTS observer_reports (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -413,25 +435,6 @@ class StructuredStorageManager:
                     action_breakdown TEXT DEFAULT '{}',
                     anomalies TEXT DEFAULT '[]',
                     metadata TEXT
-                )
-            """,
-            "planner_decisions": """
-                CREATE TABLE IF NOT EXISTS planner_decisions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    cycle_count INTEGER,
-                    decision_type TEXT NOT NULL,
-                    target_id TEXT,
-                    target_title TEXT,
-                    rule_based_reason TEXT,
-                    rule_based_confidence REAL,
-                    llm_override BOOLEAN DEFAULT 0,
-                    llm_reasoning TEXT,
-                    llm_confidence REAL,
-                    final_decision TEXT NOT NULL,
-                    final_action TEXT,
-                    metadata TEXT,
-                    UNIQUE(cycle_count, decision_type, target_id)
                 )
             """,
         }
@@ -755,194 +758,6 @@ class StructuredStorageManager:
 
         except Exception as e:
             logger.error("PostgreSQL error recording comment: %s", e)
-            conn.rollback()
-            return False
-        finally:
-            self.connection_pool.putconn(conn)
-
-    async def record_interaction(self, interaction: SocialInteraction) -> bool:
-        """Record an interaction to structured storage
-
-        Args:
-            interaction: Social interaction object
-
-        Returns:
-            bool: True if recording successful
-        """
-        try:
-            if self.config.db_type == "sqlite":
-                return self._record_interaction_sqlite(interaction)
-            elif self.config.db_type == "postgres":
-                return await self._record_interaction_postgres(interaction)
-            return False
-        except Exception as e:
-            logger.error("Error recording interaction: %s", e)
-            return False
-
-    def _record_interaction_sqlite(self, interaction: SocialInteraction) -> bool:
-        """Record interaction to SQLite"""
-        db_path = Path(self.config.sqlite_path)
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-
-        try:
-            # Ensure user exists
-            cursor.execute(
-                """
-                INSERT OR IGNORE INTO social_users
-                (user_id, username, platform, followers_count, following_count, is_verified, metadata)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-                (
-                    interaction.actor.user_id,
-                    interaction.actor.username,
-                    interaction.actor.platform.value,
-                    interaction.actor.followers_count,
-                    interaction.actor.following_count,
-                    interaction.actor.verified,
-                    json.dumps(interaction.actor.metadata)
-                    if interaction.actor.metadata
-                    else None,
-                ),
-            )
-
-            # Record interaction
-            cursor.execute(
-                """
-                INSERT OR REPLACE INTO social_interactions
-                (interaction_id, interaction_type, content, platform, target_post_id,
-                 target_comment_id, actor_id, timestamp, upvotes, downvotes, comment_count,
-                 engagement_timestamp, learning_value, feedback_score, vectorized, pattern_id, metadata)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-                (
-                    interaction.interaction_id,
-                    interaction.interaction_type.value,
-                    interaction.content,
-                    interaction.platform.value,
-                    interaction.target_post_id,
-                    interaction.target_comment_id,
-                    interaction.actor.user_id,
-                    interaction.timestamp.isoformat(),
-                    interaction.engagement_result.upvotes
-                    if interaction.engagement_result
-                    else 0,
-                    interaction.engagement_result.downvotes
-                    if interaction.engagement_result
-                    else 0,
-                    interaction.engagement_result.comment_count
-                    if interaction.engagement_result
-                    else 0,
-                    interaction.engagement_result.timestamp.isoformat()
-                    if interaction.engagement_result
-                    else None,
-                    interaction.learning_value,
-                    interaction.feedback_score,
-                    interaction.embedding is not None,
-                    interaction.pattern_id,
-                    json.dumps(interaction.metadata) if interaction.metadata else None,
-                ),
-            )
-
-            conn.commit()
-            return True
-
-        except Exception as e:
-            logger.error("SQLite error recording interaction: %s", e)
-            conn.rollback()
-            return False
-        finally:
-            conn.close()
-
-    async def _record_interaction_postgres(
-        self, interaction: SocialInteraction
-    ) -> bool:
-        """Record interaction to PostgreSQL"""
-        if not self.connection_pool:
-            return False
-
-        conn = self.connection_pool.getconn()
-        cursor = conn.cursor()
-
-        try:
-            # Ensure user exists
-            cursor.execute(
-                """
-                INSERT INTO social_users (user_id, username, platform, followers_count, following_count, is_verified, metadata)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (user_id) DO UPDATE SET
-                    username = EXCLUDED.username,
-                    followers_count = EXCLUDED.followers_count,
-                    following_count = EXCLUDED.following_count,
-                    is_verified = EXCLUDED.is_verified,
-                    metadata = EXCLUDED.metadata,
-                    updated_at = CURRENT_TIMESTAMP
-            """,
-                (
-                    interaction.actor.user_id,
-                    interaction.actor.username,
-                    interaction.actor.platform.value,
-                    interaction.actor.followers_count,
-                    interaction.actor.following_count,
-                    interaction.actor.verified,
-                    json.dumps(interaction.actor.metadata)
-                    if interaction.actor.metadata
-                    else None,
-                ),
-            )
-
-            # Record interaction
-            cursor.execute(
-                """
-                INSERT INTO social_interactions
-                (interaction_id, interaction_type, content, platform, target_post_id,
-                 target_comment_id, actor_id, timestamp, upvotes, downvotes, comment_count,
-                 engagement_timestamp, learning_value, feedback_score, vectorized, pattern_id, metadata)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (interaction_id) DO UPDATE SET
-                    upvotes = EXCLUDED.upvotes,
-                    downvotes = EXCLUDED.downvotes,
-                    comment_count = EXCLUDED.comment_count,
-                    learning_value = EXCLUDED.learning_value,
-                    feedback_score = EXCLUDED.feedback_score,
-                    vectorized = EXCLUDED.vectorized,
-                    pattern_id = EXCLUDED.pattern_id,
-                    updated_at = CURRENT_TIMESTAMP
-            """,
-                (
-                    interaction.interaction_id,
-                    interaction.interaction_type.value,
-                    interaction.content,
-                    interaction.platform.value,
-                    interaction.target_post_id,
-                    interaction.target_comment_id,
-                    interaction.actor.user_id,
-                    interaction.timestamp.isoformat(),
-                    interaction.engagement_result.upvotes
-                    if interaction.engagement_result
-                    else 0,
-                    interaction.engagement_result.downvotes
-                    if interaction.engagement_result
-                    else 0,
-                    interaction.engagement_result.comment_count
-                    if interaction.engagement_result
-                    else 0,
-                    interaction.engagement_result.timestamp.isoformat()
-                    if interaction.engagement_result
-                    else None,
-                    interaction.learning_value,
-                    interaction.feedback_score,
-                    interaction.embedding is not None,
-                    interaction.pattern_id,
-                    json.dumps(interaction.metadata) if interaction.metadata else None,
-                ),
-            )
-
-            conn.commit()
-            return True
-
-        except Exception as e:
-            logger.error("PostgreSQL error recording interaction: %s", e)
             conn.rollback()
             return False
         finally:
@@ -1325,58 +1140,91 @@ class StructuredStorageManager:
             logger.error("Error recording behavior: %s", e)
             return False
 
-    async def record_planner_decision(self, data: Dict[str, Any]) -> bool:
-        """Record a planner decision with rule-based and LLM evaluation results
+    async def get_daily_action_count(self, action_type: str, date: Optional[str] = None) -> int:
+        """Get action count for a specific type on a given day (default: today)."""
+        try:
+            if date is None:
+                date = datetime.now().strftime("%Y-%m-%d")
+            conn = self._get_sqlite_conn()
+            cursor = conn.cursor()
+            cursor.execute(
+                """SELECT COUNT(*)
+                   FROM behavior_log
+                   WHERE action_type = ? AND DATE(timestamp) = ?""",
+                (action_type, date),
+            )
+            count = cursor.fetchone()[0] or 0
+            conn.close()
+            return int(count)
+        except Exception as e:
+            logger.error("Error getting daily action count: %s", e)
+            return 0
 
-        Args:
-            data: Dict containing:
-                - cycle_count: Current cycle number
-                - decision_type: Type of decision (upvote_target, comment_target, post_decision)
-                - target_id: Target post/comment ID
-                - target_title: Target post title (for reference)
-                - rule_based_reason: Reason from rule engine
-                - rule_based_confidence: Confidence from rule engine (0-1)
-                - llm_override: Whether LLM overrode the rule
-                - llm_reasoning: LLM's reasoning for the decision
-                - llm_confidence: LLM's confidence (0-1)
-                - final_decision: Final decision made (approve/skip/modify)
-                - final_action: Specific action to take
-                - metadata: Additional metadata
-
-        Returns:
-            bool: True if recording successful
-        """
+    async def record_rate_limit_event(self, data: Dict[str, Any]) -> bool:
+        """Record allow/deny decisions from rate limit policy."""
         try:
             conn = self._get_sqlite_conn()
             cursor = conn.cursor()
             cursor.execute(
-                """INSERT OR REPLACE INTO planner_decisions
-                   (cycle_count, decision_type, target_id, target_title,
-                    rule_based_reason, rule_based_confidence,
-                    llm_override, llm_reasoning, llm_confidence,
-                    final_decision, final_action, metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                """INSERT INTO rate_limit_events
+                   (action_type, target_id, allowed, reason, details)
+                   VALUES (?, ?, ?, ?, ?)""",
                 (
-                    data.get("cycle_count"),
-                    data.get("decision_type"),
-                    data.get("target_id"),
-                    data.get("target_title"),
-                    data.get("rule_based_reason"),
-                    data.get("rule_based_confidence", 0.5),
-                    data.get("llm_override", False),
-                    data.get("llm_reasoning"),
-                    data.get("llm_confidence", 0.5),
-                    data.get("final_decision"),
-                    data.get("final_action"),
-                    json.dumps(data.get("metadata", {})),
+                    data.get("action_type", ""),
+                    data.get("target_id", ""),
+                    1 if data.get("allowed", False) else 0,
+                    data.get("reason", ""),
+                    json.dumps(data.get("details", {})),
                 ),
             )
             conn.commit()
             conn.close()
             return True
         except Exception as e:
-            logger.error("Error recording planner decision: %s", e)
+            logger.error("Error recording rate limit event: %s", e)
             return False
+
+    async def get_rate_limit_events(
+        self, cycle_count: Optional[int] = None, limit: int = 200
+    ) -> List[Dict[str, Any]]:
+        """Query rate limit events with optional cycle filter.
+
+        Note: cycle filtering is derived from details.cycle_count when available.
+        """
+        try:
+            conn = self._get_sqlite_conn()
+            cursor = conn.cursor()
+            cursor.execute(
+                """SELECT id, timestamp, action_type, target_id, allowed, reason, details
+                   FROM rate_limit_events
+                   ORDER BY id DESC
+                   LIMIT ?""",
+                (limit,),
+            )
+            rows = cursor.fetchall()
+            conn.close()
+
+            result: List[Dict[str, Any]] = []
+            for row in rows:
+                details_raw = row[6]
+                details = json.loads(details_raw) if details_raw else {}
+                item = {
+                    "id": row[0],
+                    "timestamp": row[1],
+                    "action_type": row[2],
+                    "target_id": row[3],
+                    "allowed": bool(row[4]),
+                    "reason": row[5],
+                    "details": details,
+                }
+                if cycle_count is not None:
+                    if int(details.get("cycle_count", -1)) != int(cycle_count):
+                        continue
+                result.append(item)
+            return result
+        except Exception as e:
+            logger.error("Error querying rate limit events: %s", e)
+            return []
 
     async def get_own_post_ids(self, limit: int = 50) -> List[str]:
         """Get IDs of own posts for performance tracking"""
@@ -1392,28 +1240,6 @@ class StructuredStorageManager:
             return ids
         except Exception as e:
             logger.error("Error getting own post IDs: %s", e)
-            return []
-
-    async def get_recent_interactions(
-        self, limit: int = 200, min_learning_value: float = 0.0
-    ) -> List[Dict[str, Any]]:
-        """Get recent interactions for pattern mining (sliding window + priority)"""
-        try:
-            conn = self._get_sqlite_conn()
-            cursor = conn.cursor()
-            cursor.execute(
-                """SELECT * FROM social_interactions
-                   WHERE learning_value >= ?
-                   ORDER BY learning_value DESC, timestamp DESC
-                   LIMIT ?""",
-                (min_learning_value, limit),
-            )
-            columns = [d[0] for d in cursor.description]
-            rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
-            conn.close()
-            return rows
-        except Exception as e:
-            logger.error("Error getting recent interactions: %s", e)
             return []
 
     # ── Optimized table operations (v0.2.1+) ──
@@ -1515,77 +1341,6 @@ class StructuredStorageManager:
             logger.error("Error updating comment feedback: %s", e)
             return False
 
-    async def upsert_pattern(self, data: Dict[str, Any]) -> bool:
-        """Insert or update a unified pattern (merged learning_patterns + style_patterns)"""
-        try:
-            conn = self._get_sqlite_conn()
-            cursor = conn.cursor()
-            cursor.execute(
-                """INSERT OR REPLACE INTO patterns
-                   (pattern_id, description, pattern_source, confidence, success_rate,
-                    sample_count, topics, effectiveness_score, usage_count, last_used,
-                    example_ids, metadata, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    data.get("pattern_id"),
-                    data.get("description"),
-                    data.get("pattern_source", "unknown"),  # "own_post", "community_post", "community_comment"
-                    data.get("confidence", 0.5),  # type: float
-                    data.get("success_rate", 0.0),
-                    data.get("sample_count", 0),
-                    json.dumps(data.get("topics", [])),
-                    data.get("effectiveness_score", 0.0),
-                    data.get("usage_count", 0),
-                    data.get("last_used"),
-                    json.dumps(data.get("example_ids", [])),
-                    json.dumps(data.get("metadata", {})),
-                    data.get("created_at", datetime.now().isoformat()),
-                    datetime.now().isoformat(),
-                ),
-            )
-            conn.commit()
-            conn.close()
-            return True
-        except Exception as e:
-            logger.error("Error upserting pattern: %s", e)
-            return False
-
-    async def get_patterns(
-        self, pattern_source: Optional[str] = None,
-        limit: int = 20, min_confidence: float = 0.3
-    ) -> List[Dict[str, Any]]:
-        """Get patterns optionally filtered by source and confidence"""
-        try:
-            conn = self._get_sqlite_conn()
-            cursor = conn.cursor()
-
-            query = "SELECT * FROM patterns WHERE confidence >= ?"
-            params = [min_confidence]
-
-            if pattern_source:
-                query += " AND pattern_source = ?"
-                params.append(pattern_source)
-
-            query += " ORDER BY effectiveness_score DESC, success_rate DESC LIMIT ?"
-            params.append(limit)
-
-            cursor.execute(query, params)
-            columns = [d[0] for d in cursor.description]
-            rows = []
-            for row in cursor.fetchall():
-                row_dict = dict(zip(columns, row))
-                # Parse JSON fields
-                row_dict["topics"] = json.loads(row_dict.get("topics") or "[]")
-                row_dict["example_ids"] = json.loads(row_dict.get("example_ids") or "[]")
-                row_dict["metadata"] = json.loads(row_dict.get("metadata") or "{}")
-                rows.append(row_dict)
-
-            conn.close()
-            return rows
-        except Exception as e:
-            logger.error("Error getting patterns: %s", e)
-            return []
-
     async def get_high_value_posts(
         self, limit: int = 50, min_value_score: float = 0.3
     ) -> List[Dict[str, Any]]:
@@ -1639,46 +1394,6 @@ class StructuredStorageManager:
         except Exception as e:
             logger.error("Error getting high-value comments: %s", e)
             return []
-
-    async def mark_post_as_high_value(
-        self, post_id: str, value_score: float, quality_with_karma: float
-    ) -> bool:
-        """Mark a community post as high-value with learning metrics"""
-        try:
-            conn = self._get_sqlite_conn()
-            cursor = conn.cursor()
-            cursor.execute(
-                """UPDATE social_posts
-                   SET is_high_value = TRUE, value_score = ?, quality_with_karma = ?
-                   WHERE post_id = ?""",
-                (value_score, quality_with_karma, post_id),
-            )
-            conn.commit()
-            conn.close()
-            return True
-        except Exception as e:
-            logger.error("Error marking post as high-value: %s", e)
-            return False
-
-    async def mark_comment_as_high_value(
-        self, comment_id: str, quality_score: float
-    ) -> bool:
-        """Mark a community comment as high-value with quality metric"""
-        try:
-            conn = self._get_sqlite_conn()
-            cursor = conn.cursor()
-            cursor.execute(
-                """UPDATE social_comments
-                   SET is_high_value = TRUE, quality_score = ?
-                   WHERE comment_id = ?""",
-                (quality_score, comment_id),
-            )
-            conn.commit()
-            conn.close()
-            return True
-        except Exception as e:
-            logger.error("Error marking comment as high-value: %s", e)
-            return False
 
     # ═══════════════════════════════════════════════════════════
     # Socialite v0.4.0 — New table methods
@@ -1737,29 +1452,6 @@ class StructuredStorageManager:
             return True
         except Exception as e:
             logger.error("Error recording observer report: %s", e)
-            return False
-
-    async def record_collection_strategy(self, data: Dict[str, Any]) -> bool:
-        """Record a collection strategy entry."""
-        try:
-            conn = self._get_sqlite_conn()
-            cursor = conn.cursor()
-            cursor.execute(
-                """INSERT INTO collection_strategy
-                   (strategy_type, parameters, source_agent, metadata)
-                   VALUES (?, ?, ?, ?)""",
-                (
-                    data.get("strategy_type", ""),
-                    json.dumps(data.get("parameters", {})),
-                    data.get("source_agent", ""),
-                    json.dumps(data.get("metadata", {})),
-                ),
-            )
-            conn.commit()
-            conn.close()
-            return True
-        except Exception as e:
-            logger.error("Error recording collection strategy: %s", e)
             return False
 
     # ═══════════════════════════════════════════════════════════
@@ -1835,6 +1527,136 @@ class StructuredStorageManager:
             return rows
         except Exception as e:
             logger.error("Error querying agent messages: %s", e)
+            return []
+
+    async def get_cycle_observability_summary(self, cycle_count: int) -> Dict[str, Any]:
+        """Get cycle-level observability summary from SQL views."""
+        try:
+            conn = self._get_sqlite_conn()
+            cursor = conn.cursor()
+
+            cursor.execute(
+                """SELECT direction, total
+                   FROM vw_agent_message_direction_summary
+                   WHERE cycle_count = ?""",
+                (cycle_count,),
+            )
+            direction_rows = cursor.fetchall()
+
+            cursor.execute(
+                """SELECT message_type, total
+                   FROM vw_agent_message_drop_summary
+                   WHERE cycle_count = ?""",
+                (cycle_count,),
+            )
+            drop_rows = cursor.fetchall()
+
+            cursor.execute(
+                """SELECT action_type, allowed, reason, total
+                   FROM vw_rate_limit_cycle_summary
+                   WHERE cycle_count = ?""",
+                (cycle_count,),
+            )
+            rate_limit_rows = cursor.fetchall()
+
+            conn.close()
+
+            return {
+                "cycle_count": cycle_count,
+                "directions": {row[0]: int(row[1]) for row in direction_rows},
+                "drop_types": {row[0]: int(row[1]) for row in drop_rows},
+                "rate_limit": [
+                    {
+                        "action_type": row[0],
+                        "allowed": bool(row[1]),
+                        "reason": row[2] or "",
+                        "total": int(row[3]),
+                    }
+                    for row in rate_limit_rows
+                ],
+            }
+        except Exception as e:
+            logger.error("Error querying cycle observability summary: %s", e)
+            return {"cycle_count": cycle_count, "directions": {}, "drop_types": {}, "rate_limit": []}
+
+    async def record_prompt_injection_event(self, data: Dict[str, Any]) -> bool:
+        """Record a prompt-injection suspicion/judgement event for auditing."""
+        try:
+            conn = self._get_sqlite_conn()
+            cursor = conn.cursor()
+            cursor.execute(
+                """INSERT INTO prompt_injection_events
+                   (message_id, trace_id, cycle_count, agent_name, sender,
+                    source_type, trust_level, injection_score, verdict,
+                    reasons, action_taken, excerpt, metadata)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    data.get("message_id", ""),
+                    data.get("trace_id", ""),
+                    data.get("cycle_count"),
+                    data.get("agent_name", ""),
+                    data.get("sender"),
+                    data.get("source_type", "unknown"),
+                    data.get("trust_level", "untrusted"),
+                    float(data.get("injection_score", 0.0)),
+                    data.get("verdict", "suspected"),
+                    json.dumps(data.get("reasons", [])),
+                    data.get("action_taken", "observe"),
+                    (data.get("excerpt", "") or "")[:1000],
+                    json.dumps(data.get("metadata", {})),
+                ),
+            )
+            conn.commit()
+            conn.close()
+            return True
+        except Exception as e:
+            logger.error("Error recording prompt injection event: %s", e)
+            return False
+
+    async def get_prompt_injection_events(
+        self,
+        cycle_count: Optional[int] = None,
+        agent_name: Optional[str] = None,
+        verdict: Optional[str] = None,
+        limit: int = 200,
+    ) -> List[Dict[str, Any]]:
+        """Query prompt-injection audit events."""
+        try:
+            conn = self._get_sqlite_conn()
+            cursor = conn.cursor()
+
+            query = "SELECT * FROM prompt_injection_events WHERE 1=1"
+            params: List[Any] = []
+
+            if cycle_count is not None:
+                query += " AND cycle_count = ?"
+                params.append(cycle_count)
+            if agent_name is not None:
+                query += " AND agent_name = ?"
+                params.append(agent_name)
+            if verdict is not None:
+                query += " AND verdict = ?"
+                params.append(verdict)
+
+            query += " ORDER BY id DESC LIMIT ?"
+            params.append(limit)
+
+            cursor.execute(query, params)
+            columns = [d[0] for d in cursor.description]
+            rows: List[Dict[str, Any]] = []
+            for row in cursor.fetchall():
+                item = dict(zip(columns, row))
+                item["injection_score"] = float(item.get("injection_score", 0.0) or 0.0)
+                reasons_raw = item.get("reasons")
+                metadata_raw = item.get("metadata")
+                item["reasons"] = json.loads(reasons_raw) if reasons_raw else []
+                item["metadata"] = json.loads(metadata_raw) if metadata_raw else {}
+                rows.append(item)
+
+            conn.close()
+            return rows
+        except Exception as e:
+            logger.error("Error querying prompt injection events: %s", e)
             return []
 
     async def close(self) -> None:

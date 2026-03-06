@@ -31,10 +31,13 @@ class ObserverAgent(BaseAgent):
             "A": {"count": 0, "successes": 0, "total_priority": 0.0},
             "B": {"count": 0, "successes": 0, "total_priority": 0.0},
         }
+        self._report_threshold: int = 10
 
     async def observe(self, msg: Message) -> None:
         await super().observe(msg)
-        if msg.metadata.get("type") == "action_completed":
+        msg_type = msg.metadata.get("type")
+
+        if msg_type == "action_completed":
             action_data = msg.metadata
             self._action_log.append(action_data)
             strategy = action_data.get("strategy", "A")
@@ -47,6 +50,41 @@ class ObserverAgent(BaseAgent):
                 if success:
                     stats["successes"] += 1
                 stats["total_priority"] += priority
+
+            # Auto-generate report periodically
+            if len(self._action_log) % self._report_threshold == 0:
+                report = await self.generate_report(
+                    cycle_count=len(self._action_log),
+                )
+                if self._hub:
+                    await self._hub.broadcast(Message(
+                        name=self.name,
+                        role="assistant",
+                        content="observer_report",
+                        metadata=report,
+                        causation_id=msg.id,
+                    ))
+                    logger.info(
+                        "ObserverAgent auto-report at %d "
+                        "actions",
+                        len(self._action_log),
+                    )
+
+        elif msg_type == "proposal_approved":
+            approved_count = len(
+                msg.metadata.get("approved", [])
+            )
+            rejected_count = len(
+                msg.metadata.get("rejected", [])
+            )
+            budget = msg.metadata.get("budget_remaining", 0)
+            logger.info(
+                "ObserverAgent audit: coordinator approved=%d "
+                "rejected=%d budget=$%.2f",
+                approved_count,
+                rejected_count,
+                budget,
+            )
 
     async def generate_report(self, cycle_count: int = 0) -> Dict[str, Any]:
         """Generate a summary report of A/B strategy performance."""

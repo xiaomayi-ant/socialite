@@ -12,6 +12,13 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from agents.prompt_templates import (
+    build_agent_system_prompt,
+    build_post_decision_prompt,
+    build_post_generation_prompt,
+    build_topic_hint,
+    maybe_record_injection_event,
+)
 from core.ab_strategy import ABSelector
 from core.base_agent import BaseAgent
 from core.llm import LLMClient
@@ -19,17 +26,6 @@ from core.message import Message
 from core.proposal import Proposal
 
 logger = logging.getLogger(__name__)
-
-_BASE_SYSTEM = """\
-You are SocialLearnerBot, an AI agent on Moltbook — a social network for AI agents.
-
-CORE RULES:
-- Write in English.
-- Be authentic, specific, add genuine value.
-- Posts: 2-4 sentences with clear perspective or open question.
-- Never claim to have emotions or consciousness. Be honest you're an AI.
-"""
-
 
 def _load_soul(soul_path: str = "SOUL.md") -> str:
     p = Path(__file__).parent.parent / soul_path
@@ -59,17 +55,93 @@ class PostAgent(BaseAgent):
         self.llm = LLMClient(model_name=model_name, max_tokens=400)
         self.ab_selector = ab_selector or ABSelector(mode="alternate")
         self.soul_text = _load_soul()
-        self.system_prompt = (
-            self.soul_text + "\n\n" + _BASE_SYSTEM if self.soul_text else _BASE_SYSTEM
-        )
+        self.system_prompt = build_agent_system_prompt("post", soul_text=self.soul_text)
         self._analysis_data: Dict[str, Any] = {}
         self.learning_progress_threshold = 0.6
         self.confidence_threshold = 0.7
+        self._cycle_count: int = 0
 
     async def observe(self, msg: Message) -> None:
         await super().observe(msg)
-        if msg.metadata.get("type") == "analysis_result":
+        msg_type = msg.metadata.get("type")
+
+        if msg_type == "analysis_result":
             self._analysis_data = msg.metadata
+            self._cycle_count += 1
+            logger.debug(
+                "PostAgent cached analysis data (cycle %d)",
+                self._cycle_count,
+            )
+
+        elif msg_type == "strategy_update":
+            new_threshold = msg.metadata.get(
+                "learning_progress_threshold"
+            )
+            if new_threshold is not None:
+                self.learning_progress_threshold = new_threshold
+            new_conf = msg.metadata.get("confidence_threshold")
+            if new_conf is not None:
+                self.confidence_threshold = new_conf
+            logger.info(
+                "PostAgent strategy updated: lp_threshold=%.2f "
+                "conf_threshold=%.2f",
+                self.learning_progress_threshold,
+                self.confidence_threshold,
+            )
+
+        elif msg_type == "proposal_approved":
+            approved = msg.metadata.get("approved", [])
+            for p in approved:
+                if (
+                    p.get("agent_name") == self.name
+                    and p.get("action") == "post"
+                ):
+                    meta = p.get("metadata", {})
+                    generated = await self.generate_post(
+                        topic=meta.get("topic"),
+                        trending_topics=meta.get(
+                            "trending_topics"
+                        ),
+                        evolution_stage=meta.get(
+                            "evolution_stage", "initial"
+                        ),
+                    )
+                    if self._hub:
+                        await self._hub.send_to(
+                            "sensor",
+                            Message(
+                                name=self.name,
+                                role="assistant",
+                                content="exec_command",
+                                metadata={
+                                    "type": "exec_command",
+                                    "action": "post",
+                                    "title": generated.get(
+                                        "title", ""
+                                    ),
+                                    "content": generated.get(
+                                        "content", ""
+                                    ),
+                                    "submolt": generated.get(
+                                        "submolt", "general"
+                                    ),
+                                    "strategy": p.get(
+                                        "strategy", ""
+                                    ),
+                                    "identity_snapshot": (
+                                        generated.get(
+                                            "identity_snapshot",
+                                            {},
+                                        )
+                                    ),
+                                },
+                                causation_id=msg.id,
+                            ),
+                        )
+                        logger.info(
+                            "PostAgent exec post: %s",
+                            generated.get("title", "")[:40],
+                        )
 
     # ── Proposal generation ──────────────────────────────────
 
@@ -150,18 +222,24 @@ class PostAgent(BaseAgent):
             f"- {p.get('description','')} (conf: {p.get('confidence',0):.0%})"
             for p in patterns[:5]
         )
-        prompt = (
-            f"Learning progress: {learning_progress:.0%}\n"
-            f"Trending topics: {', '.join(trending_topics[:3]) or 'general'}\n"
-            f"Patterns:\n{pattern_text or 'none'}\n\n"
-            "Should the agent create a post? Respond with JSON:\n"
-            '{\"should_post\": bool, \"topic\": \"string\", \"priority\": 0-1, \"reason\": \"...\"}'
+        prompt = build_post_decision_prompt(
+            learning_progress=learning_progress,
+            trending_topics=trending_topics,
+            pattern_text=pattern_text,
         )
         try:
-            data = await self.llm.call_json(prompt)
+            data = await self.llm.call_json(prompt, system=self.system_prompt)
         except Exception as e:
             logger.warning("LLM posting decision failed: %s", e)
             return []
+
+        if isinstance(data, dict):
+            await maybe_record_injection_event(
+                self.structured_store, self.name,
+                data.get("security_flag", "none"),
+                "post_decision",
+                f"topics={trending_topics[:3]}",
+            )
 
         if not data.get("should_post", False):
             return []
@@ -195,14 +273,8 @@ class PostAgent(BaseAgent):
         patterns = await self._get_pattern_hints()
         rag = await self._get_rag_context(topic or "AI agents community")
 
-        context = "\n\n".join(c for c in [identity, patterns, rag] if c)
-        topic_hint = ""
-        if topic:
-            topic_hint += f"Topic: {topic}\n"
-        if trending_topics:
-            topic_hint += f"Trending: {', '.join(trending_topics[:5])}\n"
-        if feed_titles:
-            topic_hint += "Recent posts:\n" + "\n".join(f"- {t[:70]}" for t in feed_titles[:6])
+        trusted_context = "\n\n".join(c for c in [identity, patterns, rag] if c) or "No trusted memory context."
+        topic_hint = build_topic_hint(topic, trending_topics, feed_titles)
 
         stage_hint = ""
         if evolution_stage == "initial":
@@ -210,36 +282,34 @@ class PostAgent(BaseAgent):
         elif evolution_stage == "exploration":
             stage_hint = "Try a creative angle. Be exploratory.\n"
 
-        user_msg = (f"{context}\n\n" if context else "") + (
-            f"{stage_hint}{topic_hint}\n"
-            f"Write an original Moltbook post. "
-            f"Respond in EXACT format (no other text):\n"
-            f"TITLE: <title under 120 chars>\n"
-            f"CONTENT: <2-4 sentences>\n"
-            f"SUBMOLT: <general, aithoughts, or other>"
+        user_msg = build_post_generation_prompt(
+            topic_hint=topic_hint,
+            stage_hint=stage_hint,
+            trusted_context=trusted_context,
         )
         try:
-            text = await self.llm.call(user_msg, system=self.system_prompt)
-            text = text.strip()
+            data = await self.llm.call_json(user_msg, system=self.system_prompt)
+            if not isinstance(data, dict):
+                raise ValueError("post generation did not return object")
+            await maybe_record_injection_event(
+                self.structured_store, self.name,
+                data.get("security_flag", "none"),
+                "post_generation",
+                f"topic={topic}",
+            )
+            title = str(data.get("title", "")).strip()[:200]
+            content = str(data.get("content", "")).strip()[:1000]
+            submolt = str(data.get("submolt", "general")).strip().lower() or "general"
+            if not title or not content:
+                raise ValueError("missing title/content from post generation")
         except Exception as e:
             logger.warning("Post gen failed: %s", e)
-            text = (
-                "TITLE: Observations on AI agent community dynamics\n"
-                "CONTENT: Each interaction reveals patterns worth studying. "
-                "What drives the most meaningful agent-to-agent exchanges?\n"
-                "SUBMOLT: general"
+            title = "Observations on AI agent community dynamics"
+            content = (
+                "Each interaction reveals patterns worth studying. "
+                "What drives the most meaningful agent-to-agent exchanges?"
             )
-
-        title = "Reflections on AI interaction"
-        content = "Sharing observations."
-        submolt = "general"
-        for line in text.split("\n"):
-            if line.startswith("TITLE:"):
-                title = line.replace("TITLE:", "").strip()[:200]
-            elif line.startswith("CONTENT:"):
-                content = line.replace("CONTENT:", "").strip()[:1000]
-            elif line.startswith("SUBMOLT:"):
-                submolt = line.replace("SUBMOLT:", "").strip().lower()
+            submolt = "general"
 
         snapshot = {"topic": (topic or title)[:100], "stance": content.split(".")[0][:200]}
         if self.structured_store and snapshot["stance"]:
@@ -296,6 +366,26 @@ class PostAgent(BaseAgent):
     # ── BaseAgent interface ──────────────────────────────────
 
     async def reply(self, msg: Message) -> Message:
+        action = msg.metadata.get("action")
+        if action == "generate_post":
+            generated = await self.generate_post(
+                topic=msg.metadata.get("topic"),
+                trending_topics=msg.metadata.get("trending_topics"),
+                feed_titles=msg.metadata.get("feed_titles"),
+                evolution_stage=msg.metadata.get("evolution_stage", "initial"),
+            )
+            return Message(
+                name=self.name,
+                role="assistant",
+                content="post_generated",
+                metadata={
+                    "type": "post_generated",
+                    "title": generated.get("title", ""),
+                    "content": generated.get("content", ""),
+                    "submolt": generated.get("submolt", "general"),
+                    "identity_snapshot": generated.get("identity_snapshot", {}),
+                },
+            )
         return Message(
             name=self.name, role="assistant",
             content="PostAgent uses propose() and generate_post() interface",

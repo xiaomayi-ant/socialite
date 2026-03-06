@@ -14,34 +14,17 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+from agents.prompt_templates import (
+    build_agent_system_prompt,
+    build_evolution_advice_prompt,
+    build_pattern_extraction_prompt,
+    maybe_record_injection_event,
+)
 from core.base_agent import BaseAgent
 from core.llm import LLMClient
 from core.message import Message
 
 logger = logging.getLogger(__name__)
-
-PATTERN_SYSTEM_PROMPT = """\
-You analyse high-performing social posts and extract **actionable** content patterns.
-
-Given posts with engagement metrics, output a JSON array of patterns. Each must have:
-- "description": specific, actionable (e.g. "question-style openings get 2x engagement on AI topics")
-- "topics": list of topic strings this pattern applies to
-- "avg_upvotes": average upvotes of matching posts
-
-Avoid generic observations. Focus on concrete, repeatable strategies.
-Respond ONLY with a JSON array. No markdown fences.\
-"""
-
-EVOLUTION_SYSTEM_PROMPT = """\
-You are the Evolution Engine. Analyse performance feedback \
-and suggest concrete strategy adjustments.
-
-Output a JSON object with:
-1. "strategy_notes": 1-2 sentence summary of what to change
-2. "adjustments": dict of parameter tweaks
-
-Respond ONLY with valid JSON. No markdown fences.\
-"""
 
 STAGE_THRESHOLDS = {"initial": 30, "exploration": 100, "optimization": 250}
 
@@ -79,13 +62,77 @@ class LearnerAgent(BaseAgent):
         self.social_memory = social_memory
         self.structured_store = structured_store
         self.llm = LLMClient(model_name=model_name, max_tokens=1024)
+        self.system_prompt = build_agent_system_prompt("learner")
         self.state = EvolutionState()
         self._action_buffer: List[Dict[str, Any]] = []
+        self._learn_threshold = 5  # auto-learn after N action_completed events
 
     async def observe(self, msg: Message) -> None:
-        await super().observe(msg)
-        if msg.metadata.get("type") == "action_completed":
+        """Accumulate action results and auto-trigger learning."""
+        msg_type = msg.metadata.get("type", "")
+
+        if msg_type == "action_completed":
             self._action_buffer.append(msg.metadata)
+            # Auto-trigger learning when enough data accumulated
+            if len(self._action_buffer) >= self._learn_threshold:
+                await self._auto_learn()
+            return
+
+        if msg_type == "analysis_result":
+            # Cache for learning data
+            self._memory.append(msg)
+            return
+
+        await super().observe(msg)
+
+    async def _auto_learn(self) -> None:
+        """Trigger learning and broadcast strategy update."""
+        logger.info("Learner: auto-triggering learning (%d actions buffered)",
+                     len(self._action_buffer))
+        try:
+            # Gather learning data from structured store
+            learning_data: Dict[str, Any] = {}
+            if self.structured_store:
+                try:
+                    community_posts = await self.structured_store.get_high_value_posts(
+                        limit=50, min_value_score=0.3
+                    )
+                    learning_data["community_posts"] = community_posts
+                except Exception:
+                    pass
+                try:
+                    community_comments = await self.structured_store.get_high_value_comments(
+                        limit=30, min_quality=0.3
+                    )
+                    learning_data["community_comments"] = community_comments
+                except Exception:
+                    pass
+                try:
+                    self_feedback = await self.structured_store.get_own_comments(limit=20)
+                    learning_data["self_feedback"] = self_feedback
+                except Exception:
+                    pass
+
+            result = await self.learn(learning_data)
+
+            # Broadcast strategy update to all agents
+            if self._hub:
+                strategy_notes = result.get("evolution_result", {}).get("strategy_notes", "")
+                await self._hub.broadcast(Message(
+                    name=self.name,
+                    role="assistant",
+                    content="strategy_update",
+                    metadata={
+                        "type": "strategy_update",
+                        "learning_progress": result.get("learning_progress", 0),
+                        "stage": self.state.stage,
+                        "exploration_rate": self.state.exploration_rate,
+                        "new_patterns": result.get("new_patterns", []),
+                        "strategy_notes": strategy_notes,
+                    },
+                ))
+        except Exception:
+            logger.exception("Auto-learn failed")
 
     # ── State persistence ────────────────────────────────────
 
@@ -408,15 +455,10 @@ class LearnerAgent(BaseAgent):
         if not lines:
             return []
         try:
-            text = await self.llm.call(
-                PATTERN_SYSTEM_PROMPT + "\n\nPosts:\n" + "\n".join(lines)
+            patterns = await self.llm.call_json(
+                build_pattern_extraction_prompt(lines),
+                system=self.system_prompt,
             )
-            text = text.strip()
-            if text.startswith("```"):
-                text = text.split("\n", 1)[-1]
-            if text.endswith("```"):
-                text = text.rsplit("```", 1)[0]
-            patterns = json.loads(text.strip())
             return patterns[:10] if isinstance(patterns, list) else []
         except Exception as e:
             logger.warning("LLM pattern extraction failed: %s", e)
@@ -592,8 +634,16 @@ class LearnerAgent(BaseAgent):
             if pattern_result:
                 context += f"Top patterns: {json.dumps(pattern_result.get('top_patterns', [])[:3], default=str)}\n"
             data = await self.llm.call_json(
-                EVOLUTION_SYSTEM_PROMPT + "\n\nData:\n" + context
+                build_evolution_advice_prompt(context),
+                system=self.system_prompt,
             )
+            if isinstance(data, dict):
+                await maybe_record_injection_event(
+                    self.structured_store, self.name,
+                    data.get("security_flag", "none"),
+                    "strategy_advice",
+                    context[:300],
+                )
             if data.get("adjustments"):
                 self.state.strategy_params.update(data["adjustments"])
             return data.get("strategy_notes", "")

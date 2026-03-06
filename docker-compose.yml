@@ -22,11 +22,11 @@ services:
     depends_on:
       - gost-tunnel
     environment:
-      HTTP_PROXY: http://gost-tunnel:1080
-      HTTPS_PROXY: http://gost-tunnel:1080
-      ALL_PROXY: http://gost-tunnel:1080
-      NO_PROXY: localhost,127.0.0.1,gost-tunnel,qdrant-shared,postgres-db,neo4j-db
-      no_proxy: localhost,127.0.0.1,gost-tunnel,qdrant-shared,postgres-db,neo4j-db
+      HTTP_PROXY: ${HTTP_PROXY:-http://gost-tunnel:1080}
+      HTTPS_PROXY: ${HTTPS_PROXY:-http://gost-tunnel:1080}
+      ALL_PROXY: ${ALL_PROXY:-http://gost-tunnel:1080}
+      NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1,gost-tunnel,qdrant-shared,postgres-db,neo4j-db}
+      no_proxy: ${no_proxy:-localhost,127.0.0.1,gost-tunnel,qdrant-shared,postgres-db,neo4j-db}
     command: python runner.py --interval ${RUN_INTERVAL_MINUTES:-30}
     networks:
       - socialite-app

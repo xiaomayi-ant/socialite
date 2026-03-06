@@ -1,39 +1,284 @@
 # -*- coding: utf-8 -*-
 """SensorAgent — intelligent feed collection + Moltbook API I/O.
 
-Multi-strategy collection: hot feed, submolt feed, semantic search.
-Accepts LearnerAgent collection suggestions via observe().
+Autonomous mode: continuously monitors feed, broadcasts new posts,
+executes actions requested by other agents.
 """
 
+import asyncio
 import json
 import logging
-from typing import Any, Dict, List, Optional
+import random
+from typing import Any, Dict, List, Optional, Set
 
 from core.base_agent import BaseAgent
 from core.message import Message
 
 logger = logging.getLogger(__name__)
 
+# Defaults for autonomous polling
+_DEFAULT_POLL_INTERVAL = 600       # 10 minutes between feed checks
+_DEFAULT_POLL_JITTER = 120         # ±2 min jitter
+_DEFAULT_FETCH_LIMIT = 10          # max posts per fetch
+_SEEN_IDS_CAP = 2000               # rolling window of seen post IDs
+
 
 class SensorAgent(BaseAgent):
     """Pure I/O gateway — no LLM attached.
 
-    Wraps MoltbookClient for feed fetching, upvoting, commenting, posting.
-    Listens for collection_suggestion messages from LearnerAgent.
+    In autonomous mode (``run()``), periodically fetches the feed and
+    broadcasts new (unseen) posts to the hub.  Also handles execution
+    commands from other agents via ``observe()``.
     """
 
-    def __init__(self, name: str = "sensor", client=None) -> None:
+    def __init__(
+        self,
+        name: str = "sensor",
+        client=None,
+        poll_interval: int = _DEFAULT_POLL_INTERVAL,
+        fetch_limit: int = _DEFAULT_FETCH_LIMIT,
+        structured_store=None,
+    ) -> None:
         super().__init__(name)
         self.client = client
-        self._collection_hints: List[str] = []  # submolt/topic suggestions from Learner
+        self.poll_interval = poll_interval
+        self.fetch_limit = fetch_limit
+        self.structured_store = structured_store
+        self._collection_hints: List[str] = []
+        self._seen_post_ids: Set[str] = set()
+        self._rate_limits = None
+        self._heartbeat = None
+
+    def set_execution_context(self, rate_limits=None, heartbeat=None) -> None:
+        """Inject execution-time helpers (rate limit policy, heartbeat state)."""
+        self._rate_limits = rate_limits
+        self._heartbeat = heartbeat
+
+    # ── Autonomous run loop ──────────────────────────────────
+
+    async def run(self) -> None:
+        """Continuously poll feed and broadcast new posts."""
+        while self._running:
+            try:
+                await self._poll_and_broadcast()
+            except Exception:
+                logger.exception("Sensor poll failed")
+
+            jitter = random.uniform(-_DEFAULT_POLL_JITTER, _DEFAULT_POLL_JITTER)
+            sleep_time = max(self.poll_interval + jitter, 30)
+            logger.debug("Sensor sleeping %.0fs", sleep_time)
+            await asyncio.sleep(sleep_time)
+
+    async def _poll_and_broadcast(self) -> None:
+        """Fetch feed, filter already-seen posts, broadcast new ones."""
+        posts = self.fetch_feed(sort="hot", limit=self.fetch_limit)
+        if not posts:
+            logger.debug("Sensor: no posts from feed")
+            return
+
+        new_posts = [p for p in posts if p.get("id") not in self._seen_post_ids]
+        if not new_posts:
+            logger.debug("Sensor: all %d posts already seen", len(posts))
+            return
+
+        # Record as seen
+        for p in new_posts:
+            self._seen_post_ids.add(p.get("id", ""))
+        # Trim rolling window
+        if len(self._seen_post_ids) > _SEEN_IDS_CAP:
+            excess = len(self._seen_post_ids) - _SEEN_IDS_CAP
+            # Remove oldest (set is unordered, but good enough for dedup)
+            for _ in range(excess):
+                self._seen_post_ids.pop()
+
+        logger.info("Sensor: %d new posts (of %d fetched)", len(new_posts), len(posts))
+
+        if self._hub:
+            await self._hub.broadcast(Message(
+                name=self.name,
+                role="assistant",
+                content=json.dumps({"type": "raw_feed", "count": len(new_posts)}),
+                metadata={"type": "raw_feed", "posts": new_posts, "count": len(new_posts)},
+            ))
+
+    # ── Observe: handle execution commands from other agents ─
 
     async def observe(self, msg: Message) -> None:
-        """Accept collection hints from LearnerAgent."""
-        await super().observe(msg)
-        if msg.metadata.get("type") == "collection_suggestion":
+        """Handle incoming messages:
+        - collection_suggestion: update hints
+        - exec_command: execute an action and broadcast result
+        """
+        msg_type = msg.metadata.get("type", "")
+
+        if msg_type == "collection_suggestion":
             hints = msg.metadata.get("suggested_submolts", [])
             self._collection_hints = hints[:5]
             logger.debug("Received collection hints: %s", self._collection_hints)
+            return
+
+        if msg_type == "exec_command":
+            await self._handle_exec_command(msg)
+            return
+
+        # Default: store in memory
+        await super().observe(msg)
+
+    async def _handle_exec_command(self, msg: Message) -> None:
+        """Execute an action command and broadcast the result."""
+        action = msg.metadata.get("action", "")
+        result: Dict[str, Any] = {"action": action, "success": False}
+
+        if action == "upvote":
+            target_id = msg.metadata.get("target_id", "")
+            ok = self.upvote(target_id) if target_id else False
+            result.update({"success": ok, "target_id": target_id})
+
+        elif action == "comment":
+            post_id = msg.metadata.get("target_id", "")
+            denied = await self._check_rate_limit("comment", post_id)
+            if denied:
+                result.update(denied)
+                await self._broadcast_action_result(msg, result)
+                return
+            text = msg.metadata.get("content", "") or msg.metadata.get("comment_text", "")
+            comment = self.create_comment(post_id, text) if post_id and text else None
+            result.update({
+                "success": bool(comment),
+                "target_id": post_id,
+                "comment": comment,
+            })
+            if comment:
+                await self._record_own_comment(comment, post_id, msg)
+                if self._heartbeat:
+                    self._heartbeat.update_comment()
+
+        elif action == "post":
+            denied = await self._check_rate_limit("post", msg.metadata.get("target_id", ""))
+            if denied:
+                result.update(denied)
+                await self._broadcast_action_result(msg, result)
+                return
+            post = self.create_post(
+                submolt=msg.metadata.get("submolt", "general"),
+                title=msg.metadata.get("title", "Untitled"),
+                content=msg.metadata.get("content", ""),
+            )
+            result.update({"success": bool(post), "post": post})
+            if post:
+                await self._record_own_post(post, msg)
+                if self._heartbeat:
+                    self._heartbeat.update_post()
+
+        elif action == "follow":
+            target_id = msg.metadata.get("target_id", "")
+            ok = self.follow_agent(target_id) if target_id else False
+            result.update({"success": ok, "target_id": target_id})
+
+        else:
+            logger.warning("Unknown exec_command action: %s", action)
+            result["reason"] = f"unknown_action: {action}"
+
+        # Carry forward proposal metadata for observability
+        result.update({
+            "type": "action_completed",
+            "strategy": msg.metadata.get("strategy", ""),
+            "priority": msg.metadata.get("priority", 0),
+            "agent_name": msg.metadata.get("agent_name", msg.name),
+        })
+        if action == "upvote" and result.get("success") and self._heartbeat:
+            self._heartbeat.update_upvote()
+
+        # Record successful actions to behavior_log
+        if result.get("success"):
+            await self._record_behavior(action, result.get("target_id", ""), msg)
+
+        await self._broadcast_action_result(msg, result)
+
+    async def _record_behavior(self, action: str, target_id: str, msg: Message) -> None:
+        """Record a successful action to behavior_log via structured store."""
+        if not self.structured_store:
+            return
+        try:
+            await self.structured_store.record_behavior({
+                "action_type": action,
+                "target_id": target_id,
+                "strategy_used": msg.metadata.get("strategy", ""),
+                "metadata": json.dumps({
+                    "agent_name": msg.metadata.get("agent_name", msg.name),
+                    "priority": msg.metadata.get("priority", 0),
+                }),
+            })
+        except Exception as e:
+            logger.debug("Record behavior failed: %s", e)
+
+    async def _check_rate_limit(self, action: str, target_id: str) -> Optional[Dict[str, Any]]:
+        if not self._rate_limits:
+            return None
+        state = getattr(self._heartbeat, "state", {}) if self._heartbeat else {}
+        decision = await self._rate_limits.check(action, state=state)
+        if decision.get("allowed", False):
+            return None
+        details = dict(decision)
+        details["cycle_count"] = int(state.get("cycle_count", 0) or 0)
+        await self._rate_limits.record_denied(action, target_id=target_id, details=details)
+        logger.info("Sensor blocked %s by rate limit: %s", action, decision.get("reason"))
+        return {
+            "success": False,
+            "target_id": target_id,
+            "rate_limited": True,
+            "reason": decision.get("reason", f"{action}_rate_limited"),
+            "rate_limit": decision,
+        }
+
+    async def _record_own_comment(
+        self, comment: Dict[str, Any], post_id: str, msg: Message
+    ) -> None:
+        if not self.structured_store:
+            return
+        try:
+            await self.structured_store.record_own_comment({
+                "comment_id": comment.get("id"),
+                "post_id": post_id,
+                "comment_text": comment.get("content", ""),
+                "success": True,
+                "metadata": {
+                    "strategy": msg.metadata.get("strategy", ""),
+                    "agent_name": msg.metadata.get("agent_name", ""),
+                },
+            })
+            logger.info("Recorded own comment %s on post %s",
+                        comment.get("id", "")[:12], post_id[:12])
+        except Exception as e:
+            logger.error("Failed to record own comment: %s", e)
+
+    async def _record_own_post(
+        self, post: Dict[str, Any], msg: Message
+    ) -> None:
+        if not self.structured_store:
+            return
+        try:
+            await self.structured_store.record_own_post({
+                "post_id": post.get("id"),
+                "title": post.get("title", ""),
+                "content": post.get("content", ""),
+                "submolt": post.get("submolt", "general"),
+                "topic": msg.metadata.get("topic", ""),
+                "evolution_stage": msg.metadata.get("evolution_stage", ""),
+            })
+            logger.info("Recorded own post %s", post.get("id", "")[:12])
+        except Exception as e:
+            logger.error("Failed to record own post: %s", e)
+
+    async def _broadcast_action_result(self, msg: Message, result: Dict[str, Any]) -> None:
+        if self._hub:
+            await self._hub.broadcast(Message(
+                name=self.name,
+                role="assistant",
+                content="action_completed",
+                metadata=result,
+                causation_id=msg.id,
+                trace_id=msg.trace_id,
+            ))
 
     # ── Feed collection ──────────────────────────────────────
 
@@ -66,6 +311,13 @@ class SensorAgent(BaseAgent):
         ]
 
     # ── API actions ──────────────────────────────────────────
+
+    def follow_agent(self, agent_name: str) -> bool:
+        try:
+            return self.client.follow_agent(agent_name)
+        except Exception as e:
+            logger.warning("Follow failed %s: %s", agent_name, e)
+            return False
 
     def upvote(self, post_id: str) -> bool:
         try:
@@ -147,14 +399,14 @@ class SensorAgent(BaseAgent):
             logger.debug("Check comment feedback failed %s: %s", post_id, e)
             return []
 
-    # ── BaseAgent interface ──────────────────────────────────
+    # ── BaseAgent interface (for request-reply) ──────────────
 
     async def reply(self, msg: Message) -> Message:
-        """Handle collect requests → return raw_feed message."""
+        """Handle request-reply: fetch_feed and check_performance only."""
         action = msg.metadata.get("action", "fetch_feed")
         if action == "fetch_feed":
             sort = msg.metadata.get("sort", "hot")
-            limit = msg.metadata.get("limit", 25)
+            limit = msg.metadata.get("limit", self.fetch_limit)
             posts = self.fetch_feed(sort=sort, limit=limit)
             return Message(
                 name=self.name,
