@@ -16,4 +16,4 @@ COPY config.py runner.py SOUL.md ./
 # Install core deps plus PostgreSQL support (psycopg2-binary extra).
 RUN pip install --upgrade pip && pip install ".[postgres]"
 
-CMD ["python", "runner.py", "--interval", "30"]
+CMD ["python", "runner.py"]
