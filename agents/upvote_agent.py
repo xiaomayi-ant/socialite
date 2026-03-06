@@ -8,6 +8,7 @@ Strategy B: LLM-based (let LLM assess post quality).
 import logging
 from typing import Any, Dict, List, Optional
 
+from agents.prompt_templates import build_agent_system_prompt, build_upvote_selection_prompt
 from core.ab_strategy import ABSelector
 from core.base_agent import BaseAgent
 from core.llm import LLMClient
@@ -28,13 +29,82 @@ class UpvoteAgent(BaseAgent):
     ) -> None:
         super().__init__(name)
         self.llm = LLMClient(model_name=model_name, max_tokens=512)
+        self.system_prompt = build_agent_system_prompt("upvote")
         self.ab_selector = ab_selector or ABSelector(mode="alternate")
         self._analysis_data: Dict[str, Any] = {}
+        self._cycle_count: int = 0
 
     async def observe(self, msg: Message) -> None:
         await super().observe(msg)
-        if msg.metadata.get("type") == "analysis_result":
+        msg_type = msg.metadata.get("type")
+
+        if msg_type == "analysis_result":
             self._analysis_data = msg.metadata
+            self._cycle_count += 1
+            posts = msg.metadata.get("posts", [])
+            if posts:
+                proposals = await self.propose(
+                    posts, self._cycle_count,
+                )
+                if proposals and self._hub:
+                    await self._hub.send_to(
+                        "coordinator",
+                        Message(
+                            name=self.name,
+                            role="assistant",
+                            content="upvote_proposals",
+                            metadata={
+                                "type": "proposals",
+                                "proposals": [
+                                    p.to_dict() for p in proposals
+                                ],
+                            },
+                            causation_id=msg.id,
+                        ),
+                    )
+                    logger.info(
+                        "UpvoteAgent sent %d proposals to coordinator",
+                        len(proposals),
+                    )
+
+        elif msg_type == "proposal_approved":
+            approved = msg.metadata.get("approved", [])
+            for p in approved:
+                if (
+                    p.get("agent_name") == self.name
+                    and p.get("action") == "upvote"
+                ):
+                    if self._hub:
+                        await self._hub.send_to(
+                            "sensor",
+                            Message(
+                                name=self.name,
+                                role="assistant",
+                                content="exec_command",
+                                metadata={
+                                    "type": "exec_command",
+                                    "action": "upvote",
+                                    "target_id": p.get(
+                                        "target_id", ""
+                                    ),
+                                    "strategy": p.get(
+                                        "strategy", ""
+                                    ),
+                                },
+                                causation_id=msg.id,
+                            ),
+                        )
+                        logger.info(
+                            "UpvoteAgent exec upvote %s",
+                            p.get("target_id", "")[:12],
+                        )
+
+        elif msg_type == "action_completed":
+            if msg.metadata.get("agent_name") == self.name:
+                logger.debug(
+                    "UpvoteAgent tracked interaction: %s",
+                    msg.metadata.get("action", "unknown"),
+                )
 
     async def propose(
         self,
@@ -91,13 +161,9 @@ class UpvoteAgent(BaseAgent):
             f"[{p.get('id','')}] {p.get('title','')[:60]} (up:{p.get('upvotes',0)})"
             for p in available[:10]
         )
-        prompt = (
-            "Which of these posts deserve an upvote? Pick the best ones.\n"
-            "Respond with JSON array: [{\"post_id\":\"...\",\"priority\":0-1}]\n\n"
-            f"Posts:\n{summaries}"
-        )
+        prompt = build_upvote_selection_prompt(summaries)
         try:
-            data = await self.llm.call_json(prompt)
+            data = await self.llm.call_json(prompt, system=self.system_prompt)
             if not isinstance(data, list):
                 data = []
         except Exception as e:

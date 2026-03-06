@@ -19,6 +19,8 @@ logger = logging.getLogger(__name__)
 class FollowAgent(BaseAgent):
     """Generates follow/unfollow Proposals based on social graph analysis."""
 
+    MAX_FOLLOWS_PER_DAY = 10
+
     def __init__(
         self,
         name: str = "follow",
@@ -29,11 +31,91 @@ class FollowAgent(BaseAgent):
         self.social_memory = social_memory
         self.ab_selector = ab_selector or ABSelector(mode="alternate")
         self._analysis_data: Dict[str, Any] = {}
+        self._cycle_count: int = 0
+        self._followed_ids: set = set()
 
     async def observe(self, msg: Message) -> None:
         await super().observe(msg)
-        if msg.metadata.get("type") == "analysis_result":
+        msg_type = msg.metadata.get("type")
+
+        if msg_type == "action_completed":
+            if (
+                msg.metadata.get("action") == "follow"
+                and msg.metadata.get("success")
+            ):
+                target = msg.metadata.get("target_id", "")
+                if target:
+                    self._followed_ids.add(target)
+            return
+
+        if msg_type == "analysis_result":
             self._analysis_data = msg.metadata
+            self._cycle_count += 1
+            if len(self._followed_ids) >= self.MAX_FOLLOWS_PER_DAY:
+                logger.info(
+                    "FollowAgent: daily limit reached (%d/%d), skipping",
+                    len(self._followed_ids), self.MAX_FOLLOWS_PER_DAY,
+                )
+                return
+            posts = msg.metadata.get("posts", [])
+            if posts:
+                proposals = await self.propose(
+                    posts, self._cycle_count,
+                    already_following=self._followed_ids,
+                )
+                if proposals and self._hub:
+                    await self._hub.send_to(
+                        "coordinator",
+                        Message(
+                            name=self.name,
+                            role="assistant",
+                            content="follow_proposals",
+                            metadata={
+                                "type": "proposals",
+                                "proposals": [
+                                    p.to_dict() for p in proposals
+                                ],
+                            },
+                            causation_id=msg.id,
+                        ),
+                    )
+                    logger.info(
+                        "FollowAgent sent %d proposals "
+                        "to coordinator",
+                        len(proposals),
+                    )
+
+        elif msg_type == "proposal_approved":
+            approved = msg.metadata.get("approved", [])
+            for p in approved:
+                if (
+                    p.get("agent_name") == self.name
+                    and p.get("action") == "follow"
+                ):
+                    if self._hub:
+                        await self._hub.send_to(
+                            "sensor",
+                            Message(
+                                name=self.name,
+                                role="assistant",
+                                content="exec_command",
+                                metadata={
+                                    "type": "exec_command",
+                                    "action": "follow",
+                                    "target_id": p.get(
+                                        "target_id", ""
+                                    ),
+                                    "strategy": p.get(
+                                        "strategy", ""
+                                    ),
+                                },
+                                causation_id=msg.id,
+                            ),
+                        )
+                        logger.info(
+                            "FollowAgent exec follow %s",
+                            p.get("target_id", ""),
+                        )
 
     async def propose(
         self,

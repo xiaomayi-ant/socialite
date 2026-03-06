@@ -43,6 +43,38 @@ class CoordinatorAgent(BaseAgent):
         self.max_upvotes = max_upvotes_per_cycle
         self.max_posts = max_posts_per_cycle
         self.max_follows = max_follows_per_cycle
+        self._cycle_count: int = 0
+
+    async def observe(self, msg: Message) -> None:
+        if msg.metadata.get("type") == "proposals":
+            proposals_data = msg.metadata.get("proposals", [])
+            proposals = [
+                Proposal.from_dict(p) for p in proposals_data
+            ]
+            self._cycle_count += 1
+            result = await self.arbitrate(
+                proposals, self._cycle_count
+            )
+            # Broadcast approved proposals
+            if self._hub:
+                await self._hub.broadcast(Message(
+                    name=self.name,
+                    role="assistant",
+                    content="arbitration_complete",
+                    metadata={
+                        "type": "proposal_approved",
+                        "approved": result.get("approved", []),
+                        "rejected": result.get(
+                            "rejected", []
+                        ),
+                        "budget_remaining": result.get(
+                            "budget_remaining", 0
+                        ),
+                    },
+                    causation_id=msg.id,
+                ))
+            return
+        await super().observe(msg)
 
     async def arbitrate(
         self, proposals: List[Proposal], cycle_count: int = 0

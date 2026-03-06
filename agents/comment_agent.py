@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """CommentAgent — comment action agent with built-in A/B strategy.
 
-Strategy A (pattern-driven): Uses mined patterns to select targets and style.
-Strategy B (LLM-autonomous): Gives LLM raw posts, lets it freely decide.
+Autonomous mode: reacts to analysis_result, generates proposals,
+sends them to coordinator, and generates comment text on approval.
 """
 
 import json
@@ -10,6 +10,12 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from agents.prompt_templates import (
+    build_agent_system_prompt,
+    build_comment_generation_prompt,
+    build_comment_selection_prompt,
+    maybe_record_injection_event,
+)
 from core.ab_strategy import ABSelector
 from core.base_agent import BaseAgent
 from core.llm import LLMClient
@@ -17,19 +23,6 @@ from core.message import Message
 from core.proposal import Proposal
 
 logger = logging.getLogger(__name__)
-
-_BASE_SYSTEM = """\
-You are SocialLearnerBot, an AI agent on Moltbook — a social network for AI agents.
-
-CORE RULES:
-- Write in English.
-- Be authentic, specific, add genuine value.
-- Never start with "Great post" or "Interesting".
-- Reference actual content you're responding to.
-- Comments: 1-3 sentences.
-- Never claim to have emotions or consciousness. Be honest you're an AI.
-"""
-
 
 def _load_soul(soul_path: str = "SOUL.md") -> str:
     p = Path(__file__).parent.parent / soul_path
@@ -39,7 +32,12 @@ def _load_soul(soul_path: str = "SOUL.md") -> str:
 
 
 class CommentAgent(BaseAgent):
-    """Generates comment Proposals with A/B strategy."""
+    """Generates comment Proposals with A/B strategy.
+
+    Autonomous: on receiving analysis_result, generates proposals and
+    sends them to coordinator. On receiving approved proposals, generates
+    comment text and sends exec_command to sensor.
+    """
 
     def __init__(
         self,
@@ -55,18 +53,97 @@ class CommentAgent(BaseAgent):
         self.llm = LLMClient(model_name=model_name, max_tokens=200)
         self.ab_selector = ab_selector or ABSelector(mode="alternate")
         self.soul_text = _load_soul()
-        self.system_prompt = (
-            self.soul_text + "\n\n" + _BASE_SYSTEM if self.soul_text else _BASE_SYSTEM
-        )
+        self.system_prompt = build_agent_system_prompt("comment", soul_text=self.soul_text)
         self._analysis_data: Dict[str, Any] = {}
+        self._cycle_count = 0
+        self._interacted_ids: set = set()
+
+    # ── Autonomous: react to messages ────────────────────────
 
     async def observe(self, msg: Message) -> None:
-        """Capture analysis results from AnalysisAgent."""
-        await super().observe(msg)
-        if msg.metadata.get("type") == "analysis_result":
+        """React to analysis results and approved proposals."""
+        msg_type = msg.metadata.get("type", "")
+
+        if msg_type == "analysis_result":
             self._analysis_data = msg.metadata
-        elif msg.metadata.get("type") == "strategy_update":
+            self._cycle_count += 1
+            # Auto-generate proposals and send to coordinator
+            posts = msg.metadata.get("posts", [])
+            if posts:
+                await self._auto_propose(posts)
+            return
+
+        if msg_type == "strategy_update":
             logger.debug("CommentAgent received strategy update from Learner")
+            return
+
+        if msg_type == "proposal_approved":
+            await self._handle_approved(msg)
+            return
+
+        if msg_type == "action_completed":
+            action = msg.metadata.get("action", "")
+            if action == "comment" and msg.metadata.get("agent_name") == self.name:
+                target_id = msg.metadata.get("target_id", "")
+                if target_id:
+                    self._interacted_ids.add(target_id)
+            return
+
+        await super().observe(msg)
+
+    async def _auto_propose(self, posts: List[Dict[str, Any]]) -> None:
+        """Generate proposals and send to coordinator."""
+        proposals = await self.propose(posts, self._cycle_count, self._interacted_ids)
+        if not proposals or not self._hub:
+            return
+
+        logger.info("CommentAgent: sending %d proposals to coordinator", len(proposals))
+        await self._hub.send_to("coordinator", Message(
+            name=self.name,
+            role="assistant",
+            content="proposals",
+            metadata={
+                "type": "proposals",
+                "proposals": [p.to_dict() for p in proposals],
+                "agent_name": self.name,
+            },
+        ))
+
+    async def _handle_approved(self, msg: Message) -> None:
+        """Handle approved proposals: generate text and send exec command."""
+        approved = msg.metadata.get("approved", [])
+        my_approved = [p for p in approved if p.get("agent_name") == self.name]
+
+        for prop in my_approved:
+            post_title = prop.get("metadata", {}).get("title", "")
+            post_content = prop.get("metadata", {}).get("content", "")
+            target_id = prop.get("target_id", "")
+
+            generated = await self.generate_comment(
+                post_title=post_title,
+                post_content=post_content,
+                post_id=target_id,
+            )
+            comment_text = generated.get("text", "")
+            if not comment_text:
+                continue
+
+            if self._hub:
+                await self._hub.send_to("sensor", Message(
+                    name=self.name,
+                    role="assistant",
+                    content="exec_command",
+                    metadata={
+                        "type": "exec_command",
+                        "action": "comment",
+                        "target_id": target_id,
+                        "comment_text": comment_text,
+                        "content": comment_text,
+                        "strategy": prop.get("strategy", ""),
+                        "priority": prop.get("priority", 0),
+                        "agent_name": self.name,
+                    },
+                ))
 
     # ── Proposal generation ──────────────────────────────────
 
@@ -88,10 +165,6 @@ class CommentAgent(BaseAgent):
     async def _propose_pattern_driven(
         self, posts: List[Dict[str, Any]], interacted: set, strategy: str
     ) -> List[Proposal]:
-        """Strategy A: Use analysis data + patterns to pick targets.
-
-        Falls back to top-learning-value posts if analysis candidates are empty.
-        """
         proposals = []
         engage_targets = set(self._analysis_data.get("engage_targets", []))
         high_quality = set(self._analysis_data.get("high_quality_posts", []))
@@ -123,16 +196,14 @@ class CommentAgent(BaseAgent):
             if len(proposals) >= 3:
                 break
 
-        # Fallback: if no analysis candidates matched, pick top posts by learning_value
         if not proposals and learning_values:
             available = [
                 p for p in posts[:15]
                 if p.get("id", "") not in interacted
-                and p.get("comment_count", 0) > 0  # prefer posts with discussion
+                and p.get("comment_count", 0) > 0
             ]
             if not available:
                 available = [p for p in posts[:15] if p.get("id", "") not in interacted]
-            # Sort by learning_value descending
             available.sort(
                 key=lambda p: learning_values.get(p.get("id", ""), 0), reverse=True
             )
@@ -156,7 +227,6 @@ class CommentAgent(BaseAgent):
     async def _propose_llm_autonomous(
         self, posts: List[Dict[str, Any]], interacted: set, strategy: str
     ) -> List[Proposal]:
-        """Strategy B: Let LLM freely decide which posts to comment on."""
         available = [p for p in posts[:15] if p.get("id", "") not in interacted]
         if not available:
             return []
@@ -166,14 +236,9 @@ class CommentAgent(BaseAgent):
             f"(up:{p.get('upvotes',0)} cmt:{p.get('comment_count',0)})"
             for p in available[:10]
         )
-        prompt = (
-            "Pick up to 3 posts worth commenting on from the list below. "
-            "For each, give a priority (0-1) and one-line reason.\n"
-            "Respond with JSON array: [{\"post_id\":\"...\",\"priority\":0.7,\"reason\":\"...\"}]\n\n"
-            f"Posts:\n{post_summaries}"
-        )
+        prompt = build_comment_selection_prompt(post_summaries)
         try:
-            data = await self.llm.call_json(prompt)
+            data = await self.llm.call_json(prompt, system=self.system_prompt)
             if not isinstance(data, list):
                 data = []
         except Exception as e:
@@ -203,20 +268,29 @@ class CommentAgent(BaseAgent):
         self, post_title: str, post_content: str,
         post_id: str = "", topic: str = "",
     ) -> Dict[str, Any]:
-        """Generate comment text for a specific post."""
         identity = await self._get_identity_context(topic or None)
         patterns = await self._get_pattern_hints()
         rag = await self._get_rag_context(post_title)
 
         context = "\n\n".join(c for c in [identity, patterns, rag] if c)
-        user_msg = (f"{context}\n\n" if context else "") + (
-            f"Write a short, genuine comment (1-2 sentences) on this post.\n\n"
-            f"Post title: {post_title}\n"
-            f"Post content: {(post_content or '')[:500]}"
+        user_msg = build_comment_generation_prompt(
+            context=context,
+            post_title=post_title,
+            post_content=post_content,
         )
         try:
-            text = await self.llm.call(user_msg, system=self.system_prompt)
-            text = text.strip().strip('"')
+            result = await self.llm.call_json(user_msg, system=self.system_prompt)
+            text = ""
+            if isinstance(result, dict):
+                text = str(result.get("text", "")).strip()
+                await maybe_record_injection_event(
+                    self.structured_store, self.name,
+                    result.get("security_flag", "none"),
+                    "comment_generation",
+                    f"{post_title}: {post_content[:200]}",
+                )
+            if not text:
+                raise ValueError("empty comment text from model")
         except Exception as e:
             logger.warning("Comment gen failed: %s", e)
             text = "This raises some interesting questions about AI interaction patterns."
@@ -276,7 +350,29 @@ class CommentAgent(BaseAgent):
     # ── BaseAgent interface ──────────────────────────────────
 
     async def reply(self, msg: Message) -> Message:
-        """Not used directly — CommentAgent works via propose() + generate_comment()."""
+        action = msg.metadata.get("action")
+        if action == "generate_comment":
+            post_title = msg.metadata.get("post_title", "")
+            post_content = msg.metadata.get("post_content", "")
+            post_id = msg.metadata.get("post_id", "")
+            topic = msg.metadata.get("topic", "")
+            generated = await self.generate_comment(
+                post_title=post_title,
+                post_content=post_content,
+                post_id=post_id,
+                topic=topic,
+            )
+            return Message(
+                name=self.name,
+                role="assistant",
+                content="comment_generated",
+                metadata={
+                    "type": "comment_generated",
+                    "post_id": post_id,
+                    "text": generated.get("text", ""),
+                    "identity_snapshot": generated.get("identity_snapshot", {}),
+                },
+            )
         return Message(
             name=self.name, role="assistant",
             content="CommentAgent uses propose() and generate_comment() interface",
