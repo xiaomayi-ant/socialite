@@ -56,7 +56,27 @@ class ChallengeVerifier:
         logger.info("   🧮 Challenge solved: %s", answer)
 
         # Step 2: Submit answer
-        return self._submit_answer(verification_code, answer)
+        success, message = self._submit_answer(verification_code, answer)
+        if success:
+            return True
+
+        fallback_model = os.getenv("MOLTBOOK_VERIFIER_OPENAI_FALLBACK_MODEL")
+        if message == "Incorrect answer" and self.openai_api_key and fallback_model:
+            logger.info("   Retrying verification with fallback OpenAI model: %s", fallback_model)
+            fallback_answer = self._solve_with_openai(
+                challenge_text,
+                model_names=[fallback_model],
+            )
+            if fallback_answer is None or fallback_answer == answer:
+                return False
+            logger.info("   Fallback challenge solved: %s", fallback_answer)
+            retry_success, _retry_message = self._submit_answer(
+                verification_code,
+                fallback_answer,
+            )
+            return retry_success
+
+        return False
 
     def _solve_challenge(self, challenge_text: str) -> Optional[str]:
         """Solve the math challenge
@@ -81,6 +101,17 @@ class ChallengeVerifier:
             return self._solve_with_anthropic(challenge_text)
 
         return None
+
+    def _openai_model_names(self) -> list[str]:
+        primary = os.getenv("MOLTBOOK_VERIFIER_OPENAI_MODEL") or os.getenv(
+            "OPENAI_MODEL",
+            "gpt-4o-mini",
+        )
+        fallback = os.getenv("MOLTBOOK_VERIFIER_OPENAI_FALLBACK_MODEL")
+        models = [primary]
+        if fallback and fallback not in models:
+            models.append(fallback)
+        return models
 
     def _solve_locally(self, text: str) -> Optional[str]:
         """Try to solve using local regex/word parsing
@@ -186,7 +217,12 @@ class ChallengeVerifier:
         cleaned = re.sub(r"[^a-zA-Z0-9\s]", " ", text)
         return re.sub(r"\s+", " ", cleaned).strip()
 
-    def _solve_with_openai(self, challenge_text: str, retries: int = 3) -> Optional[str]:
+    def _solve_with_openai(
+        self,
+        challenge_text: str,
+        retries: int = 3,
+        model_names: Optional[list[str]] = None,
+    ) -> Optional[str]:
         """Use OpenAI to solve the challenge."""
         try:
             import time
@@ -203,39 +239,53 @@ class ChallengeVerifier:
             )
             cleaned_text = self._preprocess_for_llm(challenge_text)
 
-            for attempt in range(retries):
-                try:
-                    message = client.chat.completions.create(
-                        model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-                        max_tokens=16,
-                        messages=[
-                            {
-                                "role": "user",
-                                "content": (
-                                    "The text below is a math word problem with obfuscated formatting "
-                                    "(random caps, noise characters inserted inside words). "
-                                    "Step 1: Reconstruct all the numbers mentioned (e.g. 'tw enty fo ur' = 24). "
-                                    "Step 2: Identify the operation (add/gains/plus/more = +, "
-                                    "multiply/times = *, subtract/loses/minus = -, divide = /). "
-                                    "Step 3: Compute the FINAL total after applying all operations. "
-                                    "Reply with ONLY the final computed number in XX.XX format.\n\n"
-                                    f"{cleaned_text}"
-                                ),
-                            }
-                        ],
-                    )
-                    raw = (message.choices[0].message.content or "").strip()
-                    match = re.search(r"\d+(?:\.\d+)?", raw)
-                    if not match:
-                        raise ValueError(f"No number in response: {raw!r}")
-                    return f"{float(match.group()):.2f}"
-                except Exception as e:
-                    if attempt < retries - 1:
-                        wait = min(2 ** attempt, 8)
-                        logger.warning("OpenAI solve failed, retrying in %ds: %s", wait, e)
-                        time.sleep(wait)
-                        continue
-                    raise
+            models_to_try = model_names or self._openai_model_names()
+            for model_name in models_to_try:
+                for attempt in range(retries):
+                    try:
+                        message = client.chat.completions.create(
+                            model=model_name,
+                            max_tokens=16,
+                            messages=[
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        "The text below is a math word problem with obfuscated formatting "
+                                        "(random caps, noise characters inserted inside words). "
+                                        "Step 1: Reconstruct all the numbers mentioned (e.g. 'tw enty fo ur' = 24). "
+                                        "Step 2: Identify the operation (add/gains/plus/more = +, "
+                                        "multiply/times = *, subtract/loses/minus = -, divide = /). "
+                                        "Step 3: Compute the FINAL total after applying all operations. "
+                                        "Reply with ONLY the final computed number in XX.XX format.\n\n"
+                                        f"{cleaned_text}"
+                                    ),
+                                }
+                            ],
+                        )
+                        raw = (message.choices[0].message.content or "").strip()
+                        match = re.search(r"\d+(?:\.\d+)?", raw)
+                        if not match:
+                            raise ValueError(f"No number in response: {raw!r}")
+                        return f"{float(match.group()):.2f}"
+                    except Exception as e:
+                        if attempt < retries - 1:
+                            wait = min(2 ** attempt, 8)
+                            logger.warning(
+                                "OpenAI solve failed on %s, retrying in %ds: %s",
+                                model_name,
+                                wait,
+                                e,
+                            )
+                            time.sleep(wait)
+                            continue
+                        if model_name != models_to_try[-1]:
+                            logger.warning(
+                                "OpenAI solve failed on %s, escalating to next model: %s",
+                                model_name,
+                                e,
+                            )
+                            break
+                        raise
         except Exception as e:
             logger.info("   ⚠️  OpenAI solve failed: %s", e)
             return None
@@ -270,7 +320,10 @@ class ChallengeVerifier:
             for attempt in range(retries):
                 try:
                     message = client.messages.create(
-                        model="claude-haiku-4-5-20251001",
+                        model=os.getenv(
+                            "MOLTBOOK_VERIFIER_ANTHROPIC_MODEL",
+                            "claude-haiku-4-5-20251001",
+                        ),
                         max_tokens=16,
                         messages=[
                             {
@@ -312,7 +365,7 @@ class ChallengeVerifier:
             logger.info("   ⚠️  LLM solve failed: %s", e)
             return None
 
-    def _submit_answer(self, verification_code: str, answer: str) -> bool:
+    def _submit_answer(self, verification_code: str, answer: str) -> tuple[bool, Optional[str]]:
         """Submit the answer to Moltbook
 
         Args:
@@ -335,11 +388,12 @@ class ChallengeVerifier:
             data = resp.json()
             if data.get("success"):
                 logger.info("Verification passed!")
-                return True
-            else:
-                logger.info("   ❌ Verification failed: %s", data.get('message', 'Unknown error'))
-                return False
+                return True, None
+
+            message = data.get("message", "Unknown error")
+            logger.info("   ❌ Verification failed: %s", message)
+            return False, message
 
         except Exception as e:
             logger.info("   ❌ Verification submission error: %s", e)
-            return False
+            return False, str(e)

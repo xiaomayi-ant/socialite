@@ -124,7 +124,7 @@ class VectorStorageManager:
                     logger.debug("Collection already exists: %s", collection_name)
 
             except Exception as e:
-                logger.error("Error creating collection {collection_name}: {e}")
+                logger.error("Error creating collection %s: %s", collection_name, e)
 
     def _get_distance_metric(self):
         """Get distance metric from config"""
@@ -185,7 +185,7 @@ class VectorStorageManager:
             return True
 
         except Exception as e:
-            logger.error("Error storing post vector: {e}")
+            logger.error("Error storing post vector: %s", e)
             return False
 
     async def store_comment(
@@ -236,7 +236,7 @@ class VectorStorageManager:
             return True
 
         except Exception as e:
-            logger.error("Error storing comment vector: {e}")
+            logger.error("Error storing comment vector: %s", e)
             return False
 
     async def semantic_search(
@@ -287,9 +287,10 @@ class VectorStorageManager:
                 query_filter=query_filter,
             )
 
-            # Format results (handle different result structures from qdrant-client)
+            # Format results (qdrant-client may return a list or an object with `.points`).
+            points = getattr(search_results, "points", search_results)
             results = []
-            for result in search_results:
+            for result in points:
                 results.append(
                     {
                         "id": getattr(result, "id", str(result)),
@@ -301,7 +302,7 @@ class VectorStorageManager:
             return results
 
         except Exception as e:
-            logger.error("Error performing semantic search: {e}")
+            logger.error("Error performing semantic search in %s: %s", collection_name, e)
             return []
 
     async def find_similar_posts(
@@ -396,7 +397,7 @@ class VectorStorageManager:
             return True
 
         except Exception as e:
-            logger.error("Error updating vector: {e}")
+            logger.error("Error updating vector: %s", e)
             return False
 
     async def delete_vector(
@@ -424,7 +425,7 @@ class VectorStorageManager:
             return True
 
         except Exception as e:
-            logger.error("Error deleting vector: {e}")
+            logger.error("Error deleting vector: %s", e)
             return False
 
     async def close(self) -> None:
@@ -459,5 +460,5 @@ class VectorStorageManager:
                 "status": getattr(collection_info, "status", None),
             }
         except Exception as e:
-            logger.error("Error getting collection stats: {e}")
+            logger.error("Error getting collection stats: %s", e)
             return None
