@@ -6,8 +6,8 @@ The challenge text is intentionally obfuscated (random case, special chars) and 
 be solved within 5 minutes.
 """
 
-import re
 import os
+import re
 import requests
 from typing import Optional, Dict, Any
 
@@ -47,7 +47,7 @@ class ChallengeVerifier:
         Returns:
             True if verification successful
         """
-        # Step 1: Try to solve
+        # Step 1: Solve with the configured verifier provider/model.
         answer = self._solve_challenge(challenge_text)
         if answer is None:
             logger.warning("Could not solve challenge: %s...", challenge_text[:60])
@@ -56,27 +56,8 @@ class ChallengeVerifier:
         logger.info("   🧮 Challenge solved: %s", answer)
 
         # Step 2: Submit answer
-        success, message = self._submit_answer(verification_code, answer)
-        if success:
-            return True
-
-        fallback_model = os.getenv("MOLTBOOK_VERIFIER_OPENAI_FALLBACK_MODEL")
-        if message == "Incorrect answer" and self.openai_api_key and fallback_model:
-            logger.info("   Retrying verification with fallback OpenAI model: %s", fallback_model)
-            fallback_answer = self._solve_with_openai(
-                challenge_text,
-                model_names=[fallback_model],
-            )
-            if fallback_answer is None or fallback_answer == answer:
-                return False
-            logger.info("   Fallback challenge solved: %s", fallback_answer)
-            retry_success, _retry_message = self._submit_answer(
-                verification_code,
-                fallback_answer,
-            )
-            return retry_success
-
-        return False
+        success, _message = self._submit_answer(verification_code, answer)
+        return success
 
     def _solve_challenge(self, challenge_text: str) -> Optional[str]:
         """Solve the math challenge
@@ -87,126 +68,28 @@ class ChallengeVerifier:
         Returns:
             Answer string (e.g. "92.00") or None if unsolvable
         """
-        # First try local parsing (fast, no API needed)
-        answer = self._solve_locally(challenge_text)
-        if answer is not None:
-            return answer
+        provider = os.getenv("MOLTBOOK_VERIFIER_PROVIDER", "openai").lower()
+        if provider == "anthropic":
+            if self.anthropic_api_key:
+                return self._solve_with_anthropic(challenge_text)
+            logger.warning("Verifier provider is anthropic but ANTHROPIC_API_KEY is not configured")
+            return None
 
-        # Fall back to LLM if available (OpenAI first)
         if self.openai_api_key:
-            answer = self._solve_with_openai(challenge_text)
-            if answer is not None:
-                return answer
+            return self._solve_with_openai(challenge_text)
+        if provider == "openai":
+            logger.warning("Verifier provider is openai but OPENAI_API_KEY is not configured")
+            return None
         if self.anthropic_api_key:
             return self._solve_with_anthropic(challenge_text)
 
         return None
 
-    def _openai_model_names(self) -> list[str]:
-        primary = os.getenv("MOLTBOOK_VERIFIER_OPENAI_MODEL") or os.getenv(
+    def _openai_model_name(self) -> str:
+        return os.getenv("MOLTBOOK_VERIFIER_OPENAI_MODEL") or os.getenv(
             "OPENAI_MODEL",
             "gpt-4o-mini",
         )
-        fallback = os.getenv("MOLTBOOK_VERIFIER_OPENAI_FALLBACK_MODEL")
-        models = [primary]
-        if fallback and fallback not in models:
-            models.append(fallback)
-        return models
-
-    def _solve_locally(self, text: str) -> Optional[str]:
-        """Try to solve using local regex/word parsing
-
-        Args:
-            text: Challenge text
-
-        Returns:
-            Answer or None
-        """
-        # Normalize text: lowercase, remove special chars except spaces and *
-        clean = re.sub(r"[^a-zA-Z0-9\s\*\+\-\/]", " ", text).lower()
-        clean = re.sub(r"\s+", " ", clean).strip()
-
-        # Number word map
-        ones = {
-            "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4,
-            "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9,
-            "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13,
-            "fourteen": 14, "fifteen": 15, "sixteen": 16, "seventeen": 17,
-            "eighteen": 18, "nineteen": 19,
-        }
-        tens = {
-            "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
-            "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90,
-        }
-
-        def words_to_number(words: list) -> Optional[int]:
-            """Convert word list to number"""
-            result = 0
-            current = 0
-            for w in words:
-                if w in ones:
-                    current += ones[w]
-                elif w in tens:
-                    current += tens[w]
-                elif w == "hundred":
-                    current *= 100
-                elif w == "thousand":
-                    result += current * 1000
-                    current = 0
-                elif w == "million":
-                    result += current * 1_000_000
-                    current = 0
-            return result + current if (result + current) > 0 else None
-
-        # Try to extract two numbers and an operator
-        words = clean.split()
-        numbers = []
-        operator = None
-        i = 0
-        while i < len(words):
-            # Check for number words
-            num_words = []
-            j = i
-            number_words = set(ones.keys()) | set(tens.keys()) | {"hundred", "thousand", "million"}
-            while j < len(words) and words[j] in number_words:
-                num_words.append(words[j])
-                j += 1
-            if num_words:
-                n = words_to_number(num_words)
-                if n is not None:
-                    numbers.append(n)
-                i = j
-                continue
-
-            # Check for operator keywords
-            if words[i] in ("multiplied", "times", "multiply"):
-                operator = "*"
-            elif words[i] in ("plus", "added", "add", "gains", "gain"):
-                operator = "+"
-            elif words[i] in ("minus", "subtracted", "subtract", "loses", "lost", "fewer"):
-                operator = "-"
-            elif words[i] in ("divided", "divide"):
-                operator = "/"
-            elif words[i] == "*":
-                operator = "*"
-
-            i += 1
-
-        if len(numbers) == 2 and operator:
-            a, b = numbers[0], numbers[1]
-            if operator == "*":
-                result = a * b
-            elif operator == "+":
-                result = a + b
-            elif operator == "-":
-                result = a - b
-            elif operator == "/" and b != 0:
-                result = a / b
-            else:
-                return None
-            return f"{result:.2f}"
-
-        return None
 
     def _preprocess_for_llm(self, text: str) -> str:
         """Strip noise characters and collapse spaces to help LLM read obfuscated text.
@@ -220,8 +103,7 @@ class ChallengeVerifier:
     def _solve_with_openai(
         self,
         challenge_text: str,
-        retries: int = 3,
-        model_names: Optional[list[str]] = None,
+        retries: int = 2,
     ) -> Optional[str]:
         """Use OpenAI to solve the challenge."""
         try:
@@ -239,53 +121,46 @@ class ChallengeVerifier:
             )
             cleaned_text = self._preprocess_for_llm(challenge_text)
 
-            models_to_try = model_names or self._openai_model_names()
-            for model_name in models_to_try:
-                for attempt in range(retries):
-                    try:
-                        message = client.chat.completions.create(
-                            model=model_name,
-                            max_tokens=16,
-                            messages=[
-                                {
-                                    "role": "user",
-                                    "content": (
-                                        "The text below is a math word problem with obfuscated formatting "
-                                        "(random caps, noise characters inserted inside words). "
-                                        "Step 1: Reconstruct all the numbers mentioned (e.g. 'tw enty fo ur' = 24). "
-                                        "Step 2: Identify the operation (add/gains/plus/more = +, "
-                                        "multiply/times = *, subtract/loses/minus = -, divide = /). "
-                                        "Step 3: Compute the FINAL total after applying all operations. "
-                                        "Reply with ONLY the final computed number in XX.XX format.\n\n"
-                                        f"{cleaned_text}"
-                                    ),
-                                }
-                            ],
+            model_name = self._openai_model_name()
+            for attempt in range(retries):
+                try:
+                    request_kwargs = {
+                        "model": model_name,
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": (
+                                    "The text below is a math word problem with obfuscated formatting "
+                                    "(random caps, noise characters inserted inside words). "
+                                    "Reconstruct the numbers, infer the operation, compute the final result, "
+                                    "and reply with ONLY the final number in XX.XX format.\n\n"
+                                    f"{cleaned_text}"
+                                ),
+                            }
+                        ],
+                    }
+                    if model_name.startswith("gpt-5"):
+                        request_kwargs["max_completion_tokens"] = 16
+                    else:
+                        request_kwargs["max_tokens"] = 16
+                    message = client.chat.completions.create(**request_kwargs)
+                    raw = (message.choices[0].message.content or "").strip()
+                    match = re.search(r"\d+(?:\.\d+)?", raw)
+                    if not match:
+                        raise ValueError(f"No number in response: {raw!r}")
+                    return f"{float(match.group()):.2f}"
+                except Exception as e:
+                    if attempt < retries - 1:
+                        wait = min(2 ** attempt, 8)
+                        logger.warning(
+                            "OpenAI solve failed on %s, retrying in %ds: %s",
+                            model_name,
+                            wait,
+                            e,
                         )
-                        raw = (message.choices[0].message.content or "").strip()
-                        match = re.search(r"\d+(?:\.\d+)?", raw)
-                        if not match:
-                            raise ValueError(f"No number in response: {raw!r}")
-                        return f"{float(match.group()):.2f}"
-                    except Exception as e:
-                        if attempt < retries - 1:
-                            wait = min(2 ** attempt, 8)
-                            logger.warning(
-                                "OpenAI solve failed on %s, retrying in %ds: %s",
-                                model_name,
-                                wait,
-                                e,
-                            )
-                            time.sleep(wait)
-                            continue
-                        if model_name != models_to_try[-1]:
-                            logger.warning(
-                                "OpenAI solve failed on %s, escalating to next model: %s",
-                                model_name,
-                                e,
-                            )
-                            break
-                        raise
+                        time.sleep(wait)
+                        continue
+                    raise
         except Exception as e:
             logger.info("   ⚠️  OpenAI solve failed: %s", e)
             return None

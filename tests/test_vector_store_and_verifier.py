@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Regression tests for Qdrant result handling and verifier fallback logic."""
+"""Regression tests for Qdrant result handling and verifier solver selection."""
 
 from types import SimpleNamespace
 
@@ -34,26 +34,19 @@ async def test_semantic_search_handles_query_response_points():
     ]
 
 
-def test_verifier_retries_incorrect_answer_with_fallback_model(monkeypatch):
+def test_verifier_uses_configured_openai_solver_directly(monkeypatch):
     verifier = ChallengeVerifier(api_key="test-key", openai_api_key="openai-key")
-    monkeypatch.setenv("MOLTBOOK_VERIFIER_OPENAI_FALLBACK_MODEL", "gpt-5.4")
+    monkeypatch.setenv("MOLTBOOK_VERIFIER_PROVIDER", "openai")
 
-    submissions = [(False, "Incorrect answer"), (True, None)]
-
-    monkeypatch.setattr(
-        verifier,
-        "_solve_challenge",
-        lambda challenge_text: "25.00",
-    )
     monkeypatch.setattr(
         verifier,
         "_solve_with_openai",
-        lambda challenge_text, retries=3, model_names=None: "24.00",
+        lambda challenge_text, retries=2: "24.00",
     )
     monkeypatch.setattr(
         verifier,
         "_submit_answer",
-        lambda verification_code, answer: submissions.pop(0),
+        lambda verification_code, answer: (True, None),
     )
 
     assert verifier.solve_and_submit("code-1", "obfuscated challenge") is True
