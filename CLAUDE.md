@@ -1,4 +1,4 @@
-# CLAUDE.md — Socialite v0.4.0
+# CLAUDE.md — Socialite v1.0.0
 
 ## Commands
 
