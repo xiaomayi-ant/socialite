@@ -60,6 +60,7 @@ class PostAgent(BaseAgent):
         self.learning_progress_threshold = 0.6
         self.confidence_threshold = 0.7
         self._cycle_count: int = 0
+        self._q_priority_boost: float = 0.0
 
     async def observe(self, msg: Message) -> None:
         await super().observe(msg)
@@ -74,19 +75,19 @@ class PostAgent(BaseAgent):
             )
 
         elif msg_type == "strategy_update":
-            new_threshold = msg.metadata.get(
-                "learning_progress_threshold"
-            )
+            new_threshold = msg.metadata.get("learning_progress_threshold")
             if new_threshold is not None:
                 self.learning_progress_threshold = new_threshold
             new_conf = msg.metadata.get("confidence_threshold")
             if new_conf is not None:
                 self.confidence_threshold = new_conf
+            self._q_priority_boost = float(msg.metadata.get("q_priority_boost_post", 0.0))
             logger.info(
                 "PostAgent strategy updated: lp_threshold=%.2f "
-                "conf_threshold=%.2f",
+                "conf_threshold=%.2f q_boost=%.3f",
                 self.learning_progress_threshold,
                 self.confidence_threshold,
+                self._q_priority_boost,
             )
 
         elif msg_type == "proposal_approved":
@@ -159,13 +160,20 @@ class PostAgent(BaseAgent):
         topics = trending_topics or self._analysis_data.get("trending_topics", [])
 
         if strategy == "A":
-            return await self._propose_pattern_driven(
+            proposals = await self._propose_pattern_driven(
                 learning_progress, patterns, topics, evolution_stage, strategy
             )
         else:
-            return await self._propose_llm_autonomous(
+            proposals = await self._propose_llm_autonomous(
                 learning_progress, patterns, topics, evolution_stage, strategy
             )
+
+        # Apply Q-learning priority boost from LearnerAgent's last strategy_update
+        if self._q_priority_boost > 0:
+            for p in proposals:
+                p.priority = round(min(p.priority + self._q_priority_boost, 1.0), 3)
+
+        return proposals
 
     async def _propose_pattern_driven(
         self,

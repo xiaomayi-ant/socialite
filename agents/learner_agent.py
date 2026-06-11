@@ -4,15 +4,20 @@
 Merges v1 PatternMinerAgent + EvolutionAgent.
 Subscribes to action_completed → accumulates data → periodic learning.
 Publishes strategy_update + collection_suggestion.
+
+Q-learning layer (dual-track):
+  Pattern Mining handles cold-start and coarse strategy signals.
+  QTable refines action priorities via TD updates on real interaction rewards.
 """
 
 import json
 import logging
 import math
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional
 
 from agents.prompt_templates import (
     build_agent_system_prompt,
@@ -23,6 +28,13 @@ from agents.prompt_templates import (
 from core.base_agent import BaseAgent
 from core.llm import LLMClient
 from core.message import Message
+from core.q_learning import (
+    ACTIONS,
+    QTable,
+    SocialState,
+    compute_immediate_reward,
+    extract_state,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -67,23 +79,72 @@ class LearnerAgent(BaseAgent):
         self._action_buffer: List[Dict[str, Any]] = []
         self._learn_threshold = 5  # auto-learn after N action_completed events
 
+        # ── Q-learning ───────────────────────────────────────
+        self.q_table = QTable(epsilon=self.state.exploration_rate)
+        self._current_state: Optional[SocialState] = None
+        # rolling window of recent action success flags for state computation
+        self._recent_results: Deque[bool] = deque(maxlen=20)
+
     async def observe(self, msg: Message) -> None:
         """Accumulate action results and auto-trigger learning."""
         msg_type = msg.metadata.get("type", "")
 
         if msg_type == "action_completed":
             self._action_buffer.append(msg.metadata)
-            # Auto-trigger learning when enough data accumulated
+            success = bool(msg.metadata.get("success", False))
+            self._recent_results.append(success)
+            self._q_update_from_action(msg.metadata)
             if len(self._action_buffer) >= self._learn_threshold:
                 await self._auto_learn()
             return
 
         if msg_type == "analysis_result":
-            # Cache for learning data
+            # Cache for learning data and update Q-learning state
             self._memory.append(msg)
+            self._current_state = extract_state(
+                analysis_data=msg.metadata,
+                evolution_stage=self.state.stage,
+                recent_success_rate=self._recent_success_rate(),
+            )
+            logger.debug("Q-state updated: %s", self._current_state.to_key())
             return
 
         await super().observe(msg)
+
+    # ── Q-learning helpers ────────────────────────────────────
+
+    def _recent_success_rate(self) -> float:
+        if not self._recent_results:
+            return 0.5
+        return sum(self._recent_results) / len(self._recent_results)
+
+    def _q_update_from_action(self, action_meta: Dict[str, Any]) -> None:
+        """Apply immediate TD update when an action_completed arrives."""
+        if self._current_state is None:
+            return
+        action_type = action_meta.get("action", "")
+        strategy = action_meta.get("strategy", "A")
+        # Map action_type + strategy to a Q-action key
+        if action_type == "comment":
+            q_action = "comment_technical" if strategy == "A" else "comment_casual"
+        elif action_type == "post":
+            q_action = "post_insight" if strategy == "A" else "post_question"
+        elif action_type in ACTIONS:
+            q_action = action_type
+        else:
+            return
+        reward = compute_immediate_reward(action_meta)
+        # next_state approximated as current state; updated on next analysis_result
+        self.q_table.update(
+            state=self._current_state,
+            action=q_action,
+            reward=reward,
+            next_state=self._current_state,
+        )
+        logger.debug(
+            "Q update: action=%s reward=%.3f updates=%d",
+            q_action, reward, self.q_table.update_count,
+        )
 
     async def _auto_learn(self) -> None:
         """Trigger learning and broadcast strategy update."""
@@ -118,6 +179,21 @@ class LearnerAgent(BaseAgent):
             # Broadcast strategy update to all agents
             if self._hub:
                 strategy_notes = result.get("evolution_result", {}).get("strategy_notes", "")
+                q_meta: Dict[str, Any] = {}
+                if self._current_state:
+                    q_meta = {
+                        "q_values": self.q_table.get_q_values(self._current_state),
+                        "q_priority_boost_comment": self.q_table.priority_boost(
+                            self._current_state, "comment"
+                        ),
+                        "q_priority_boost_post": self.q_table.priority_boost(
+                            self._current_state, "post"
+                        ),
+                        "q_recommended_comment": self.q_table.best_action_for_type(
+                            self._current_state, "comment"
+                        ),
+                        "q_update_count": self.q_table.update_count,
+                    }
                 await self._hub.broadcast(Message(
                     name=self.name,
                     role="assistant",
@@ -129,6 +205,7 @@ class LearnerAgent(BaseAgent):
                         "exploration_rate": self.state.exploration_rate,
                         "new_patterns": result.get("new_patterns", []),
                         "strategy_notes": strategy_notes,
+                        **q_meta,
                     },
                 ))
         except Exception:
@@ -148,6 +225,20 @@ class LearnerAgent(BaseAgent):
             self.state.plateau_counter = metrics.get("plateau_counter", 0)
             self.state.best_metrics = saved.get("best_metrics", self.state.best_metrics)
             self.state.strategy_params = metrics.get("strategy_params", {})
+            # Restore Q-table
+            q_data = metrics.get("q_table")
+            if q_data:
+                try:
+                    if isinstance(q_data, str):
+                        q_data = json.loads(q_data)
+                    self.q_table = QTable.from_dict(q_data)
+                    self.q_table.epsilon = self.state.exploration_rate
+                    logger.info(
+                        "Loaded Q-table: %d updates across %d states",
+                        self.q_table.update_count, len(self.q_table._table),
+                    )
+                except Exception as e:
+                    logger.warning("Q-table restore failed, starting fresh: %s", e)
             logger.info(
                 "Loaded evolution state: stage=%s cycles=%d",
                 self.state.stage, self.state.cycle_count,
@@ -163,6 +254,7 @@ class LearnerAgent(BaseAgent):
                 "cycle_count": self.state.cycle_count,
                 "plateau_counter": self.state.plateau_counter,
                 "strategy_params": self.state.strategy_params,
+                "q_table": self.q_table.to_dict(),
             },
             "best_metrics": self.state.best_metrics,
             "strategy_notes": strategy_notes,
@@ -621,6 +713,8 @@ class LearnerAgent(BaseAgent):
                 self.state.exploration_rate = max(
                     round(self.state.exploration_rate * 0.99, 4), 0.05
                 )
+        # Keep Q-table epsilon in sync with evolution exploration rate
+        self.q_table.epsilon = self.state.exploration_rate
 
     async def _get_strategy_advice(
         self, metrics: Dict[str, float], pattern_result: Dict[str, Any]

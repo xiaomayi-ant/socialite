@@ -57,6 +57,7 @@ class CommentAgent(BaseAgent):
         self._analysis_data: Dict[str, Any] = {}
         self._cycle_count = 0
         self._interacted_ids: set = set()
+        self._q_priority_boost: float = 0.0
 
     # ── Autonomous: react to messages ────────────────────────
 
@@ -74,7 +75,10 @@ class CommentAgent(BaseAgent):
             return
 
         if msg_type == "strategy_update":
-            logger.debug("CommentAgent received strategy update from Learner")
+            self._q_priority_boost = float(msg.metadata.get("q_priority_boost_comment", 0.0))
+            logger.debug(
+                "CommentAgent strategy update: q_boost=%.3f", self._q_priority_boost
+            )
             return
 
         if msg_type == "proposal_approved":
@@ -158,9 +162,16 @@ class CommentAgent(BaseAgent):
         interacted = interacted_ids or set()
 
         if strategy == "A":
-            return await self._propose_pattern_driven(posts, interacted, strategy)
+            proposals = await self._propose_pattern_driven(posts, interacted, strategy)
         else:
-            return await self._propose_llm_autonomous(posts, interacted, strategy)
+            proposals = await self._propose_llm_autonomous(posts, interacted, strategy)
+
+        # Apply Q-learning priority boost from LearnerAgent's last strategy_update
+        if self._q_priority_boost > 0:
+            for p in proposals:
+                p.priority = round(min(p.priority + self._q_priority_boost, 1.0), 3)
+
+        return proposals
 
     async def _propose_pattern_driven(
         self, posts: List[Dict[str, Any]], interacted: set, strategy: str
